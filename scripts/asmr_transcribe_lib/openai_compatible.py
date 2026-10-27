@@ -44,11 +44,24 @@ def preflight_model(base_url: str, model: str, *, client: httpx.Client | None = 
 DEFAULT_MAX_TOKENS_CAP = 768
 DEFAULT_FREQUENCY_PENALTY = 0.1
 
+# Sakura v1.0 native prompt (see GalTransl/Backend/Prompts.py). Sakura is trained on
+# newline-separated text, not JSON, so one subtitle per line maps back reliably.
+SAKURA_SYSTEM_PROMPT = (
+    "你是一个轻小说翻译模型，可以流畅通顺地以日本轻小说的风格将日文翻译成简体中文，"
+    "并联系上下文正确使用人称代词，注意不要擅自添加原文中没有的代词，也不要擅自增加或减少换行。"
+)
+SAKURA_USER_PREFIX = "将下面的日文文本翻译成中文："
+
+
+def to_prompt_lines(texts: Sequence[str]) -> list[str]:
+    # Multi-line SRT blocks are flattened so each block is exactly one prompt line.
+    return [" ".join(part.strip() for part in text.splitlines() if part.strip()) for text in texts]
+
 
 def estimate_max_tokens(texts: Sequence[str], *, cap: int = DEFAULT_MAX_TOKENS_CAP) -> int:
     # Without a cap llama-server generates until the slot is full, then context-shifts
     # (dropping the system prompt) and loops forever when Sakura degenerates.
-    input_chars = len(json.dumps(list(texts), ensure_ascii=False))
+    input_chars = sum(len(line) + 1 for line in to_prompt_lines(texts))
     return max(64, min(cap, 64 + int(input_chars * 1.5)))
 
 
@@ -70,17 +83,8 @@ def chat_completion_json_array(
             json={
                 "model": model,
                 "messages": [
-                    {
-                        "role": "system",
-                        "content": (
-                            "你是字幕翻譯器。請把輸入的日文或來源語字幕翻譯成簡體中文。"
-                            "只輸出 JSON array of strings，不要輸出 markdown，不要改變順序。"
-                        ),
-                    },
-                    {
-                        "role": "user",
-                        "content": json.dumps(list(texts), ensure_ascii=False),
-                    },
+                    {"role": "system", "content": SAKURA_SYSTEM_PROMPT},
+                    {"role": "user", "content": SAKURA_USER_PREFIX + "\n".join(to_prompt_lines(texts))},
                 ],
                 # Sakura-recommended sampling; frequency_penalty breaks repetition loops.
                 "temperature": 0.1,
@@ -107,6 +111,11 @@ def chat_completion_json_array(
 
 
 def parse_translation_content(content: str, *, expected_count: int) -> list[str]:
+    if not content.lstrip().startswith("["):
+        lines = _parse_plain_line_translations(content, expected_count=expected_count)
+        if lines is None:
+            raise OpenAICompatibleError(f"translation count mismatch: expected {expected_count} lines")
+        return lines
     try:
         parsed = json.loads(content)
     except json.JSONDecodeError as exc:

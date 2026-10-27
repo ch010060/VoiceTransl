@@ -7,9 +7,18 @@ import pytest
 from scripts.asmr_transcribe_lib.openai_compatible import (
     ModelNotFoundError,
     OpenAICompatibleError,
+    SAKURA_SYSTEM_PROMPT,
+    SAKURA_USER_PREFIX,
     preflight_model,
 )
 from scripts.asmr_transcribe_lib.translation import translate_srt_to_simplified
+
+
+def requested_lines(body) -> list[str]:
+    assert body["messages"][0]["content"] == SAKURA_SYSTEM_PROMPT
+    content = body["messages"][1]["content"]
+    assert content.startswith(SAKURA_USER_PREFIX)
+    return content[len(SAKURA_USER_PREFIX):].split("\n")
 
 
 def make_client(handler):
@@ -59,7 +68,7 @@ def test_translate_srt_to_simplified_preserves_index_and_timestamp(tmp_path: Pat
         assert request.method == "POST"
         assert request.url.path == "/v1/chat/completions"
         body = json.loads(request.read().decode("utf-8"))
-        assert json.loads(body["messages"][1]["content"]) == ["こんにちは。", "雨の音。"]
+        assert requested_lines(body) == ["こんにちは。", "雨の音。"]
         return httpx.Response(200, json={"choices": [{"message": {"content": '["你好。", "雨声。"]'}}]})
 
     with make_client(handler) as client:
@@ -132,7 +141,7 @@ def test_translate_srt_splits_chunk_when_batch_response_cannot_be_mapped(tmp_pat
 
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.read().decode("utf-8"))
-        requested = json.loads(body["messages"][1]["content"])
+        requested = requested_lines(body)
         request_sizes.append(len(requested))
         if len(requested) > 1:
             return httpx.Response(200, json={"choices": [{"message": {"content": "合併成一行，無法對應。"}}]})
@@ -166,7 +175,7 @@ def test_translate_srt_fails_safely_on_block_count_mismatch(tmp_path: Path):
 
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.read().decode("utf-8"))
-        requested = json.loads(body["messages"][1]["content"])
+        requested = requested_lines(body)
         if len(requested) == 1:
             return httpx.Response(200, json={"choices": [{"message": {"content": "[]"}}]})
         return httpx.Response(200, json={"choices": [{"message": {"content": '["只有一句。"]'}}]})
@@ -198,3 +207,24 @@ def test_translate_srt_caps_tokens_and_rejects_truncated_output(tmp_path: Path):
     assert all(0 < body["max_tokens"] <= 768 for body in bodies)
     assert bodies[1]["frequency_penalty"] > bodies[0]["frequency_penalty"]
     assert "你好" in target.read_text(encoding="utf-8")
+
+
+
+def test_translate_srt_flattens_multiline_blocks_to_one_prompt_line(tmp_path: Path):
+    source = tmp_path / "track-transcribe.srt"
+    target = tmp_path / "track-translate.srt"
+    source.write_text(
+        "1\n00:00:01,000 --> 00:00:02,000\nこんにちは。\nお兄ちゃん。\n\n"
+        "2\n00:00:03,000 --> 00:00:04,000\n雨の音。\n",
+        encoding="utf-8",
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.read().decode("utf-8"))
+        assert requested_lines(body) == ["こんにちは。 お兄ちゃん。", "雨の音。"]
+        return httpx.Response(200, json={"choices": [{"message": {"content": "你好。哥哥。\n雨声。"}, "finish_reason": "stop"}]})
+
+    with make_client(handler) as client:
+        translate_srt_to_simplified(source, target, base_url="http://127.0.0.1:8080/v1", model="model", client=client)
+
+    assert "你好。哥哥。" in target.read_text(encoding="utf-8")
