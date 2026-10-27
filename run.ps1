@@ -3,7 +3,7 @@ param(
     [string]$TargetPath = "W:\github\VoiceTransl\input",
     [int]$Parallel = 5,
     [int]$TranscribeParallel = 1,
-    [int]$TranslateChunkSize = 30,
+    [int]$TranslateChunkSize = 20,
     [switch]$FastTranscribe,
     [string]$InitialPrompt = "",
     [switch]$NoAsmrPrompt,

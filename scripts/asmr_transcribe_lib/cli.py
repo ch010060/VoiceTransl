@@ -64,7 +64,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--kotoba_chunk_length", type=int, default=15)
     parser.add_argument("--faster_whisper_param", default=str(DEFAULT_FASTER_WHISPER_PARAM), help="Project-local Faster Whisper command template file (display-only, does not alter the built command).")
     parser.add_argument("--fast_transcribe", action="store_true", help="Speed preset: batched inference (batch_size=16, --unmerged). ~3.6x faster but lower quality — do NOT use for production subtitle output.")
-    parser.add_argument("--translate_chunk_size", type=int, default=30, help="Max SRT blocks per translation request. Keep ≤30 for ctx=12288/n=8 (1536 tokens/slot); raise only if you have larger ctx.")
+    parser.add_argument("--translate_chunk_size", type=int, default=20, help="Max SRT lines per translation request. 20 measured best for Sakura v1.0 (fewer line-count mismatches than 30 at equal or lower total time).")
     parser.add_argument("--initial_prompt", default=None, help="Custom Whisper decoder initial prompt. Overrides the built-in ASMR vocabulary prompt.")
     parser.add_argument("--no_asmr_prompt", action="store_true", help="Disable the built-in ASMR vocabulary prompt. Use when transcribing non-adult content.")
     parser.add_argument("--translate_model", default=DEFAULT_TRANSLATE_MODEL)
