@@ -253,3 +253,26 @@ def test_translate_srt_sends_repeated_lines_once(tmp_path: Path):
     out = target.read_text(encoding="utf-8")
     assert out.count("译かきー。") == 3
     assert out.count("译こきー。") == 2
+
+
+def test_translate_srt_keeps_blank_blocks_without_sending_them(tmp_path: Path):
+    source = tmp_path / "track-transcribe.srt"
+    target = tmp_path / "track-translate.srt"
+    source.write_text(
+        "1\n00:00:01,000 --> 00:00:02,000\nこんにちは。\n\n"
+        "2\n00:00:03,000 --> 00:00:04,000\n\n"
+        "3\n00:00:05,000 --> 00:00:06,000\n雨の音。\n",
+        encoding="utf-8",
+    )
+    sent = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        lines = requested_lines(json.loads(request.read().decode("utf-8")))
+        sent.append(lines)
+        return httpx.Response(200, json={"choices": [{"message": {"content": "你好。\n雨声。"}, "finish_reason": "stop"}]})
+
+    with make_client(handler) as client:
+        translate_srt_to_simplified(source, target, base_url="http://127.0.0.1:8080/v1", model="model", client=client)
+
+    assert sent == [["こんにちは。", "雨の音。"]]
+    assert "你好。" in target.read_text(encoding="utf-8")

@@ -25,8 +25,10 @@ def translate_srt_to_simplified(
     source_texts = ["\n".join(block.text) for block in blocks]
     # Translate each distinct line once: long runs of repeated SFX lines (かきー。×N)
     # make Sakura lose count of lines, and repeats cost extra requests.
-    unique_texts = list(dict.fromkeys(source_texts))
-    translations: dict[str, str] = {}
+    # Blank blocks are kept as-is: an empty prompt line is dropped by the model and
+    # would make every retry fail the line-count check.
+    translations: dict[str, str] = {text: text for text in source_texts if not text.strip()}
+    unique_texts = [text for text in dict.fromkeys(source_texts) if text not in translations]
 
     for chunk in _chunks(unique_texts, max_blocks):
         translations.update(
