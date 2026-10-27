@@ -22,19 +22,27 @@ def translate_srt_to_simplified(
     source = Path(source_srt_path)
     target = Path(target_srt_path)
     blocks = parse_srt_file(source)
-    translated_texts: list[str] = []
+    source_texts = ["\n".join(block.text) for block in blocks]
+    # Translate each distinct line once: long runs of repeated SFX lines (かきー。×N)
+    # make Sakura lose count of lines, and repeats cost extra requests.
+    unique_texts = list(dict.fromkeys(source_texts))
+    translations: dict[str, str] = {}
 
-    for chunk in _chunks(["\n".join(block.text) for block in blocks], max_blocks):
-        translated_texts.extend(
-            _translate_chunk_resilient(
+    for chunk in _chunks(unique_texts, max_blocks):
+        translations.update(
+            zip(
                 chunk,
-                base_url=base_url,
-                model=model,
-                client=client,
-                max_retries=max_retries,
+                _translate_chunk_resilient(
+                    chunk,
+                    base_url=base_url,
+                    model=model,
+                    client=client,
+                    max_retries=max_retries,
+                ),
             )
         )
 
+    translated_texts = [translations[text] for text in source_texts]
     replaced = replace_block_text(blocks, translated_texts)
     validate_same_timing(blocks, replaced)
     target.parent.mkdir(parents=True, exist_ok=True)

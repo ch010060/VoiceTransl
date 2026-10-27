@@ -228,3 +228,28 @@ def test_translate_srt_flattens_multiline_blocks_to_one_prompt_line(tmp_path: Pa
         translate_srt_to_simplified(source, target, base_url="http://127.0.0.1:8080/v1", model="model", client=client)
 
     assert "你好。哥哥。" in target.read_text(encoding="utf-8")
+
+
+def test_translate_srt_sends_repeated_lines_once(tmp_path: Path):
+    source = tmp_path / "track-transcribe.srt"
+    target = tmp_path / "track-translate.srt"
+    texts = ["かきー。", "こきー。", "かきー。", "かきー。", "ね。", "こきー。"]
+    source.write_text(
+        "".join(f"{i}\n00:00:{i:02d},000 --> 00:00:{i:02d},500\n{t}\n\n" for i, t in enumerate(texts, start=1)),
+        encoding="utf-8",
+    )
+    sent = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        lines = requested_lines(json.loads(request.read().decode("utf-8")))
+        sent.append(lines)
+        reply = "\n".join(f"译{line}" for line in lines)
+        return httpx.Response(200, json={"choices": [{"message": {"content": reply}, "finish_reason": "stop"}]})
+
+    with make_client(handler) as client:
+        translate_srt_to_simplified(source, target, base_url="http://127.0.0.1:8080/v1", model="model", client=client)
+
+    assert sent == [["かきー。", "こきー。", "ね。"]]
+    out = target.read_text(encoding="utf-8")
+    assert out.count("译かきー。") == 3
+    assert out.count("译こきー。") == 2
