@@ -46,6 +46,8 @@ DEFAULT_TRANSLATE_MODEL = "sakura-14b-qwen2.5-v1.0-q4km.gguf"
 DEFAULT_PARALLEL = 5
 DEFAULT_TRANSCRIBE_PARALLEL = 1
 DEFAULT_FASTER_WHISPER_PARAM = Path("whisper-faster") / "param.txt"
+# Sentinel stored in the transcription-progress map once a task moves on to translation.
+_TRANSLATING = (-1.0, 0.0, 0.0)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -167,13 +169,16 @@ def main(argv: list[str] | None = None) -> int:
             def _on_progress(ratio: float, cur: float, tot: float) -> None:
                 if idx is not None:
                     progress.update_transcription_progress(idx, ratio, cur, tot)
-            return run_faster_whisper_transcription(
+            result = run_faster_whisper_transcription(
                 audio_path=audio_path,
                 transcribe_srt_path=transcribe_srt_path,
                 project_root=project_root,
                 config=config,
                 transcription_progress_callback=_on_progress,
             )
+            if idx is not None:
+                progress.mark_translating(idx)
+            return result
 
         progress.render()
 
@@ -281,6 +286,11 @@ class _ProgressDashboard:
             if monotonic() - self._last_render >= self._RENDER_INTERVAL:
                 self._render_locked()
 
+    def mark_translating(self, index: int) -> None:
+        with self._lock:
+            self._transcription_progress[index] = _TRANSLATING
+            self._render_locked()
+
     def _heartbeat_loop(self) -> None:
         while not self._stopped.wait(self._HEARTBEAT_INTERVAL):
             with self._lock:
@@ -346,6 +356,8 @@ def _visible_dashboard_tasks(tasks: list[AudioTask], *, max_rows: int) -> list[t
 
 def _stage_label(task: AudioTask, transcription_progress: tuple[float, float, float] | None = None) -> str:
     if task.status == "running" and task.action == "process":
+        if transcription_progress == _TRANSLATING:
+            return "translate"
         if transcription_progress is not None:
             ratio, cur, tot = transcription_progress
             return f"transcribe {int(ratio * 100)}% {_format_elapsed(cur)}/{_format_elapsed(tot)}"
