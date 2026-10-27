@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "description": "Initial conservative Traditional Chinese subtitle post-processing corrections after OpenCC conversion.",
+  "rules": [
+    {
+      "wrong": "想象",
+      "correct": "想像",
+      "note": "Taiwan Traditional Chinese prefers 想像."
+    },
+    {
+      "wrong": "惡心",
+      "correct": "噁心",
+      "note": "Natural Traditional Chinese wording for nausea/disgust."
+    },
+    {
+      "wrong": "好惡心",
+      "correct": "好噁心",
+      "note": "Common OpenCC output cleanup."
+    },
+    {
+      "wrong": "好惡，好噁心",
+      "correct": "噁，好噁心",
+      "note": "ASMR dialogue cleanup for Sakura/OpenCC output."
+    },
+    {
+      "wrong": "好惡，好惡心",
+      "correct": "噁，好噁心",
+      "note": "Variant before generic 惡心 replacement."
+    }
+  ]
+}

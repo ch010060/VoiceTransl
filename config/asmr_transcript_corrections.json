@@ -1,0 +1,274 @@
+{
+  "version": 1,
+  "description": "Initial conservative ASMR/adult-audio Japanese transcript corrections. Rules are context-gated to avoid broad false replacements.",
+  "rules": [
+    {
+      "wrong": "作成",
+      "correct": "搾精",
+      "include_any": [
+        "サキュバス",
+        "チンポ",
+        "精子",
+        "絶頂",
+        "クロエ",
+        "ティファニー"
+      ],
+      "note": "Adult succubus context: Whisper may confuse 搾精 with 作成."
+    },
+    {
+      "wrong": "気持ちはない",
+      "correct": "気持ち悪い",
+      "include_any": [
+        "きも",
+        "想像",
+        "勃起",
+        "家畜"
+      ],
+      "note": "Insult context: likely 気持ち悪い rather than lack of feelings."
+    },
+    {
+      "wrong": "気持ちはない。",
+      "correct": "気持ち悪い。",
+      "include_any": [
+        "きも",
+        "想像",
+        "勃起",
+        "家畜"
+      ],
+      "note": "Punctuated variant of 気持ち悪い correction."
+    },
+    {
+      "wrong": "こう都合",
+      "correct": "好都合",
+      "include_any": [
+        "じゃあ",
+        "都合"
+      ],
+      "note": "ASMR dialogue: 好都合 is often transcribed as こう都合."
+    },
+    {
+      "wrong": "明日、入れて",
+      "correct": "舌、入れて",
+      "include_any": [
+        "キス",
+        "入れて"
+      ],
+      "note": "Kiss context: 舌入れて may be misrecognized as 明日入れて."
+    },
+    {
+      "wrong": "明日入れて",
+      "correct": "舌入れて",
+      "include_any": [
+        "キス",
+        "入れて"
+      ],
+      "note": "Unpunctuated variant of 舌入れて."
+    },
+    {
+      "wrong": "下、入れて",
+      "correct": "舌、入れて",
+      "include_any": [
+        "キス",
+        "入れて"
+      ],
+      "note": "Kiss context: 舌 may be transcribed as 下."
+    },
+    {
+      "wrong": "下入れて",
+      "correct": "舌入れて",
+      "include_any": [
+        "キス",
+        "入れて"
+      ],
+      "note": "Unpunctuated variant of 舌入れて."
+    },
+    {
+      "wrong": "射線",
+      "correct": "射精",
+      "include_any": [
+        "早く",
+        "しちゃい",
+        "出して",
+        "楽しみ"
+      ],
+      "note": "Adult climax context: 射精 often becomes 射線."
+    },
+    {
+      "wrong": "車線",
+      "correct": "射精",
+      "include_any": [
+        "早く",
+        "しちゃい",
+        "出して",
+        "楽しみ"
+      ],
+      "note": "Adult climax context: 射精 often becomes 車線."
+    },
+    {
+      "wrong": "写真",
+      "correct": "射精",
+      "include_any": [
+        "あんたの",
+        "早く",
+        "楽しみ",
+        "しちゃい"
+      ],
+      "note": "Adult climax context: 射精 may be misrecognized as 写真."
+    },
+    {
+      "wrong": "所詮",
+      "correct": "射精",
+      "include_any": [
+        "あんたの",
+        "早く",
+        "楽しみ",
+        "しちゃい"
+      ],
+      "note": "Adult climax context: 射精 may be misrecognized as 所詮."
+    },
+    {
+      "wrong": "水液",
+      "correct": "精液",
+      "include_any": [
+        "汚れ",
+        "受け止め",
+        "出して",
+        "ドロドロ"
+      ],
+      "note": "Adult fluid context: 精液 may be misrecognized as 水液."
+    },
+    {
+      "wrong": "湿が汚れない",
+      "correct": "シーツが汚れない",
+      "include_any": [
+        "精液",
+        "水液",
+        "受け止め"
+      ],
+      "note": "Adult scene context: シーツが汚れない may become 湿が汚れない."
+    },
+    {
+      "wrong": "室が汚れない",
+      "correct": "シーツが汚れない",
+      "include_any": [
+        "精液",
+        "水液",
+        "受け止め"
+      ],
+      "note": "Adult scene context: シーツが汚れない may become 室が汚れない."
+    },
+    {
+      "wrong": "8日、完全に勃起",
+      "correct": "おちんちん、完全に勃起",
+      "include_any": [
+        "勃起",
+        "興奮"
+      ],
+      "note": "Adult body context: おちんちん may become 8日."
+    },
+    {
+      "wrong": "ホッチンチ",
+      "correct": "おちんちん",
+      "include_any": [
+        "勃起",
+        "あったか",
+        "ぬくもり",
+        "シコ"
+      ],
+      "note": "Adult body context correction."
+    },
+    {
+      "wrong": "もちんちん",
+      "correct": "おちんちん",
+      "include_any": [
+        "元気",
+        "勃起",
+        "シコ"
+      ],
+      "note": "Adult body context correction."
+    },
+    {
+      "wrong": "サキバス",
+      "correct": "サキュバス",
+      "include_any": [
+        "クロエ",
+        "立派",
+        "なのだから"
+      ],
+      "note": "Succubus context: サキュバス may be transcribed as サキバス."
+    },
+    {
+      "wrong": "作成もできる",
+      "correct": "搾精もできる",
+      "include_any": [
+        "ちゃんと",
+        "できるようにならねば"
+      ],
+      "note": "Succubus/adult context may split away from サキュバス; this phrase is 搾精."
+    },
+    {
+      "wrong": "正義も、いただき放題",
+      "correct": "精気も、いただき放題",
+      "include_any": [
+        "こいつ",
+        "いただき放題"
+      ],
+      "note": "Succubus context: 精気 may be transcribed as 正義."
+    },
+    {
+      "wrong": "世紀も、いただき放題",
+      "correct": "精気も、いただき放題",
+      "include_any": [
+        "こいつ",
+        "いただき放題"
+      ],
+      "note": "Succubus context: 精気 may be transcribed as 世紀."
+    },
+    {
+      "wrong": "生意気も、いただき放題",
+      "correct": "精気も、いただき放題",
+      "include_any": [
+        "こいつ",
+        "いただき放題"
+      ],
+      "note": "Succubus context: 精気 may be transcribed as 生意気."
+    },
+    {
+      "wrong": "いただけるせいで十分",
+      "correct": "いただける精で十分",
+      "include_any": [
+        "ティファニー様",
+        "いただける"
+      ],
+      "note": "Succubus context: 精 may be transcribed as せい."
+    },
+    {
+      "wrong": "いただけるせいで充分",
+      "correct": "いただける精で充分",
+      "include_any": [
+        "ティファニー様",
+        "いただける"
+      ],
+      "note": "Succubus context: 精 may be transcribed as せい."
+    },
+    {
+      "wrong": "ですのね",
+      "correct": "ですので",
+      "include_any": [
+        "十分",
+        "充分",
+        "いただける精"
+      ],
+      "note": "Polite ending in this sample."
+    },
+    {
+      "wrong": "良してやれ",
+      "correct": "よしてやれ",
+      "include_any": [
+        "攻撃",
+        "五感"
+      ],
+      "note": "Phrase よしてやれ may be transcribed with kanji 良."
+    }
+  ]
+}
