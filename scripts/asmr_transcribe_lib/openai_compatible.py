@@ -41,6 +41,17 @@ def preflight_model(base_url: str, model: str, *, client: httpx.Client | None = 
             active_client.close()
 
 
+DEFAULT_MAX_TOKENS_CAP = 768
+DEFAULT_FREQUENCY_PENALTY = 0.1
+
+
+def estimate_max_tokens(texts: Sequence[str], *, cap: int = DEFAULT_MAX_TOKENS_CAP) -> int:
+    # Without a cap llama-server generates until the slot is full, then context-shifts
+    # (dropping the system prompt) and loops forever when Sakura degenerates.
+    input_chars = len(json.dumps(list(texts), ensure_ascii=False))
+    return max(64, min(cap, 64 + int(input_chars * 1.5)))
+
+
 def chat_completion_json_array(
     *,
     base_url: str,
@@ -48,6 +59,8 @@ def chat_completion_json_array(
     texts: Sequence[str],
     client: httpx.Client | None = None,
     timeout: float = 120.0,
+    max_tokens: int | None = None,
+    frequency_penalty: float = DEFAULT_FREQUENCY_PENALTY,
 ) -> list[str]:
     owns_client = client is None
     active_client = client or httpx.Client(timeout=timeout)
@@ -69,15 +82,22 @@ def chat_completion_json_array(
                         "content": json.dumps(list(texts), ensure_ascii=False),
                     },
                 ],
-                "temperature": 0,
+                # Sakura-recommended sampling; frequency_penalty breaks repetition loops.
+                "temperature": 0.1,
+                "top_p": 0.3,
+                "frequency_penalty": frequency_penalty,
+                "max_tokens": max_tokens if max_tokens is not None else estimate_max_tokens(texts),
             },
         )
         response.raise_for_status()
         payload = response.json()
         try:
-            content = payload["choices"][0]["message"]["content"]
+            choice = payload["choices"][0]
+            content = choice["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
             raise OpenAICompatibleError("unsupported chat/completions response shape") from exc
+        if choice.get("finish_reason") == "length":
+            raise OpenAICompatibleError("chat/completions output truncated at max_tokens (likely repetition loop)")
         return parse_translation_content(content, expected_count=len(texts))
     except httpx.HTTPError as exc:
         raise OpenAICompatibleError(f"chat/completions request failed: {exc}") from exc

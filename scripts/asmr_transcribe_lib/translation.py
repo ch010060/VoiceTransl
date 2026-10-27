@@ -5,7 +5,7 @@ from collections.abc import Sequence
 
 import httpx
 
-from .openai_compatible import OpenAICompatibleError, chat_completion_json_array
+from .openai_compatible import DEFAULT_FREQUENCY_PENALTY, OpenAICompatibleError, chat_completion_json_array
 from .srt_utils import parse_srt_file, replace_block_text, validate_same_timing, write_srt_file
 
 
@@ -93,9 +93,16 @@ def _translate_chunk_with_retry(
     max_retries: int,
 ) -> list[str]:
     last_error: OpenAICompatibleError | None = None
-    for _attempt in range(max_retries):
+    for attempt in range(max_retries):
         try:
-            return chat_completion_json_array(base_url=base_url, model=model, texts=texts, client=client)
+            # Raise the penalty on each retry so a degenerate loop is not replayed verbatim.
+            return chat_completion_json_array(
+                base_url=base_url,
+                model=model,
+                texts=texts,
+                client=client,
+                frequency_penalty=DEFAULT_FREQUENCY_PENALTY + 0.1 * attempt,
+            )
         except OpenAICompatibleError as exc:
             last_error = exc
     assert last_error is not None

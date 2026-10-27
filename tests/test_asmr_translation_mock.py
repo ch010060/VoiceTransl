@@ -176,3 +176,25 @@ def test_translate_srt_fails_safely_on_block_count_mismatch(tmp_path: Path):
             translate_srt_to_simplified(source, target, base_url="http://127.0.0.1:8080/v1", model="model", client=client, max_retries=2)
 
     assert not target.exists()
+
+
+def test_translate_srt_caps_tokens_and_rejects_truncated_output(tmp_path: Path):
+    source = tmp_path / "track-transcribe.srt"
+    target = tmp_path / "track-translate.srt"
+    source.write_text("1\n00:00:01,000 --> 00:00:02,000\nこんにちは。\n", encoding="utf-8")
+    bodies = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.read().decode("utf-8"))
+        bodies.append(body)
+        if len(bodies) == 1:
+            return httpx.Response(200, json={"choices": [{"message": {"content": "啊啊啊啊"}, "finish_reason": "length"}]})
+        return httpx.Response(200, json={"choices": [{"message": {"content": '["你好。"]'}, "finish_reason": "stop"}]})
+
+    with make_client(handler) as client:
+        translate_srt_to_simplified(source, target, base_url="http://127.0.0.1:8080/v1", model="model", client=client)
+
+    assert len(bodies) == 2
+    assert all(0 < body["max_tokens"] <= 768 for body in bodies)
+    assert bodies[1]["frequency_penalty"] > bodies[0]["frequency_penalty"]
+    assert "你好" in target.read_text(encoding="utf-8")
