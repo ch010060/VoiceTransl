@@ -73,6 +73,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--transcribe_parallel", type=int, default=DEFAULT_TRANSCRIBE_PARALLEL, help="Maximum concurrent transcription jobs. Default 1 avoids GPU contention for large-v3.")
     parser.add_argument("--dry-run", action="store_true", help="Scan and print the queue without calling APIs or writing outputs.")
     parser.add_argument("--execute", action="store_true", help="Run preflight and process the discovered queue.")
+    parser.add_argument("--transcribe_only", action="store_true", help="Only write *-transcribe.srt next to each audio file; skip translation and the translation API preflight.")
     parser.add_argument("--limit", type=int, default=None, help="Maximum number of queued audio files to process in this run.")
     return parser
 
@@ -124,8 +125,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     try:
-        preflight_model(args.translate_api, args.translate_model)
-        print("Preflight translation API: OK")
+        if args.transcribe_only:
+            print("Preflight translation API: skipped (--transcribe_only)")
+        else:
+            preflight_model(args.translate_api, args.translate_model)
+            print("Preflight translation API: OK")
         transcriber = None
         if args.transcribe_backend == "kotoba":
             preflight_kotoba_faster_whisper()
@@ -176,7 +180,7 @@ def main(argv: list[str] | None = None) -> int:
                 config=config,
                 transcription_progress_callback=_on_progress,
             )
-            if idx is not None:
+            if idx is not None and not args.transcribe_only:
                 progress.mark_translating(idx)
             return result
 
@@ -195,7 +199,7 @@ def main(argv: list[str] | None = None) -> int:
             tasks,
             project_root=project_root,
             faster_whisper_config=config,
-            translator=translator,
+            translator=None if args.transcribe_only else translator,
             transcriber=transcriber or _xxl_transcriber,
             limit=args.limit,
             parallel=args.parallel,

@@ -221,3 +221,29 @@ def test_cli_execute_reports_preflight_error_without_traceback(monkeypatch, tmp_
     assert exit_code == 1
     assert "ERROR: missing local faster-whisper model" in captured.err
     assert "Traceback" not in captured.err
+
+
+def test_cli_transcribe_only_skips_translation_preflight_and_translator(monkeypatch, tmp_path: Path, capsys):
+    root = tmp_path / "root"
+    audio = root / "work" / "track.wav"
+    audio.parent.mkdir(parents=True)
+    audio.write_text("audio", encoding="utf-8")
+    seen = {}
+
+    def fail_preflight_model(base_url, model):
+        raise AssertionError("translation preflight must be skipped")
+
+    def fake_run_tasks(tasks, **kwargs):
+        seen["translator"] = kwargs["translator"]
+        return [TaskResult(status="transcribed", reason="transcribe_complete", audio_path=tasks[0].audio_path, output_path=tasks[0].transcribe_srt_path)]
+
+    monkeypatch.setattr(cli, "preflight_faster_whisper", lambda project_root: Path(project_root) / "fw.exe")
+    monkeypatch.setattr(cli, "preflight_faster_whisper_model", lambda project_root, model: None)
+    monkeypatch.setattr(cli, "preflight_model", fail_preflight_model)
+    monkeypatch.setattr(cli, "run_tasks", fake_run_tasks)
+
+    exit_code = cli.main(["--path", str(root), "--execute", "--transcribe_only"])
+
+    assert exit_code == 0
+    assert seen["translator"] is None
+    assert "Preflight translation API: skipped" in capsys.readouterr().out
