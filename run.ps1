@@ -5,12 +5,17 @@ param(
     [int]$TranscribeParallel = 1,
     [int]$TranslateChunkSize = 20,
     [switch]$FastTranscribe,
+    [switch]$SequentialTranscribe,
+    [switch]$TranscribeOnly,
     [string]$InitialPrompt = "",
     [switch]$NoAsmrPrompt,
     [switch]$DryRun
 )
 
 $ErrorActionPreference = "Stop"
+if ($FastTranscribe -and $SequentialTranscribe) {
+    throw "Choose either -FastTranscribe or -SequentialTranscribe."
+}
 
 # Keep Japanese / Chinese paths and SRT text stable in PowerShell output.
 chcp 65001 | Out-Null
@@ -76,6 +81,12 @@ $arguments = @(
 if ($FastTranscribe) {
     $arguments += "--fast_transcribe"
 }
+if ($SequentialTranscribe) {
+    $arguments += "--sequential_transcribe"
+}
+if ($TranscribeOnly) {
+    $arguments += "--transcribe_only"
+}
 if ($NoAsmrPrompt) {
     $arguments += "--no_asmr_prompt"
 } elseif ($InitialPrompt -ne "") {
@@ -87,7 +98,8 @@ Write-Host "Project: $PSScriptRoot"
 Write-Host "Input path: $inputPath"
 Write-Host "Mode: $modeFlag"
 Write-Host "Parallel: $Parallel  |  Transcribe parallel: $TranscribeParallel"
-Write-Host "Translate chunk size: $TranslateChunkSize$(if ($FastTranscribe) { '  |  Fast transcribe: ON (preview quality)' })"
+Write-Host "Translate chunk size: $TranslateChunkSize"
+Write-Host "Transcription preset: $(if ($SequentialTranscribe) { 'sequential' } else { 'batched (batch_size=8, sentence=True, chunk_length=20)' })"
 Write-Host "Conda: $condaExe"
 Write-Host ""
 

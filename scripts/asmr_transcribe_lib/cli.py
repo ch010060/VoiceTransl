@@ -65,7 +65,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--kotoba_device", default="cuda", help="Device for the experimental Kotoba Python adapter; default uses CUDA.")
     parser.add_argument("--kotoba_chunk_length", type=int, default=15)
     parser.add_argument("--faster_whisper_param", default=str(DEFAULT_FASTER_WHISPER_PARAM), help="Project-local Faster Whisper command template file (display-only, does not alter the built command).")
-    parser.add_argument("--fast_transcribe", action="store_true", help="Speed preset: batched inference (batch_size=8, --sentence, --chunk_length 20). ~5.3x faster but ~5%% of text differs from the default sequential mode (some dropped/extra lines) — use for previews, not final subtitles.")
+    preset = parser.add_mutually_exclusive_group()
+    preset.add_argument("--fast_transcribe", action="store_true", default=True, help="Use the default batched preset: batch_size=8, sentence splitting, chunk_length=20 (about 5.3x faster in local tests).")
+    preset.add_argument("--sequential_transcribe", dest="fast_transcribe", action="store_false", help="Use sequential decoding instead of the default batched preset.")
     parser.add_argument("--translate_chunk_size", type=int, default=20, help="Max SRT lines per translation request. 20 measured best for Sakura v1.0 (fewer line-count mismatches than 30 at equal or lower total time).")
     parser.add_argument("--initial_prompt", default=None, help="Custom Whisper decoder initial prompt. Overrides the built-in ASMR vocabulary prompt.")
     parser.add_argument("--no_asmr_prompt", action="store_true", help="Disable the built-in ASMR vocabulary prompt. Use when transcribing non-adult content.")
@@ -112,6 +114,9 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Faster-Whisper executable: {exe_display}")
     print(f"Faster-Whisper command template (display only): {_safe_for_stdout(_truncate_text(_read_command_template(faster_whisper_param), 120))}")
     print(f"Transcription model: {effective_transcribe_model}")
+    if args.transcribe_backend == "xxl":
+        preset_label = "batched (batch_size=8, sentence=True, chunk_length=20)" if args.fast_transcribe else "sequential"
+        print(f"Transcription preset: {preset_label}")
     effective_prompt = _effective_initial_prompt(args.initial_prompt, args.no_asmr_prompt)
     prompt_display = _safe_for_stdout(_truncate_text(effective_prompt, 80)) if effective_prompt else "<disabled>"
     print(f"Initial prompt: {prompt_display}")
@@ -160,7 +165,7 @@ def main(argv: list[str] | None = None) -> int:
                 language=args.src_lang,
                 compute_type=args.transcribe_compute_type,
                 model_dir=find_faster_whisper_model_dir(project_root),
-                # fast preset measured 2026-10 on real ASMR: 5.3x faster, ~5% kana CER vs sequential.
+                # Default approved after meaning review; ~5% text difference is not an error rate.
                 # --sentence re-splits batched output into normal-length subtitles.
                 batched=args.fast_transcribe,
                 batch_size=FAST_BATCH_SIZE,

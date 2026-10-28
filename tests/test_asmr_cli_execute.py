@@ -276,7 +276,21 @@ def test_fast_transcribe_uses_batched8_sentence_chunk20(monkeypatch, tmp_path: P
     assert (config.batched, config.batch_size, config.sentence, config.chunk_length, config.unmerged) == (True, 8, True, 20, False)
 
 
-def test_default_transcribe_stays_sequential(monkeypatch, tmp_path: Path):
+def test_default_transcribe_uses_batched8_sentence_chunk20(monkeypatch, tmp_path: Path):
     config = _capture_config(monkeypatch, tmp_path, [])
 
+    assert (config.batched, config.batch_size, config.sentence, config.chunk_length, config.unmerged) == (True, 8, True, 20, False)
+
+
+def test_sequential_transcribe_explicitly_disables_batched_preset(monkeypatch, tmp_path: Path):
+    config = _capture_config(monkeypatch, tmp_path, ["--sequential_transcribe"])
+
     assert (config.batched, config.sentence, config.chunk_length) == (False, False, None)
+
+
+def test_transcription_presets_are_mutually_exclusive():
+    import pytest
+
+    with pytest.raises(SystemExit) as error:
+        cli.build_parser().parse_args(["--path", ".", "--fast_transcribe", "--sequential_transcribe"])
+    assert error.value.code == 2
