@@ -16,6 +16,8 @@ metric. Variants:
   batched8_c20/c15  batched8_sent with 20 s / 15 s windows instead of 30 s
   parakeet          NVIDIA Parakeet in the asmr-parakeet env
   whisperx          WhisperX large-v3 + forced alignment in the asmr-whisperx env
+  python_batched    experimental faster-whisper API control (not identical to XXL)
+  two_pass          same API control, suspicious spans retried sequentially
 --reuse_base skips re-running base; --rescore skips all transcription and recomputes the
 table from SRTs already in --out. SRTs are kept in .asmr_bench_out/<variant>/.
 """
@@ -64,6 +66,8 @@ VARIANTS: dict[str, dict] = {
     ]},
     "parakeet": {"runner": ("asmr-parakeet", "parakeet_transcribe.py")},
     "whisperx": {"runner": ("asmr-whisperx", "whisperx_transcribe.py")},
+    "python_batched": {"runner": ("asmr", "asmr_python_batched_transcribe.py")},
+    "two_pass": {"runner": ("asmr", "asmr_two_pass_transcribe.py")},
 }
 DEFAULT_VARIANTS = ["base", "parallel2", "batched4", "batched8"]
 
