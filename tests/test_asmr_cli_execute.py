@@ -271,15 +271,36 @@ def _capture_config(monkeypatch, tmp_path: Path, extra_args: list[str]):
 
 
 def test_fast_transcribe_uses_batched8_sentence_chunk20(monkeypatch, tmp_path: Path):
-    config = _capture_config(monkeypatch, tmp_path, ["--fast_transcribe"])
+    config = _capture_config(monkeypatch, tmp_path, ["--fast_transcribe", "--transcribe_batch_size", "8"])
 
     assert (config.batched, config.batch_size, config.sentence, config.chunk_length, config.unmerged) == (True, 8, True, 20, False)
 
 
-def test_default_transcribe_uses_batched8_sentence_chunk20(monkeypatch, tmp_path: Path):
+def test_default_transcribe_uses_batched12_sentence_chunk20(monkeypatch, tmp_path: Path):
     config = _capture_config(monkeypatch, tmp_path, [])
 
-    assert (config.batched, config.batch_size, config.sentence, config.chunk_length, config.unmerged) == (True, 8, True, 20, False)
+    assert (config.batched, config.batch_size, config.sentence, config.chunk_length, config.unmerged) == (True, 12, True, 20, False)
+
+
+def test_fast_flag_preserves_default_batch12(monkeypatch, tmp_path: Path):
+    config = _capture_config(monkeypatch, tmp_path, ["--fast_transcribe"])
+    assert config.batched is True
+    assert config.batch_size == 12
+
+
+def test_batch_size_override_does_not_enable_sequential_batching(monkeypatch, tmp_path: Path):
+    config = _capture_config(monkeypatch, tmp_path, ["--sequential_transcribe", "--transcribe_batch_size", "8"])
+    assert (config.batched, config.batch_size, config.sentence, config.chunk_length) == (False, 8, False, None)
+
+
+def test_cli_rejects_nonpositive_transcribe_batch_size(capsys):
+    import pytest
+
+    for size in ("0", "-1"):
+        with pytest.raises(SystemExit) as error:
+            cli.main(["--path", ".", "--transcribe_batch_size", size])
+        assert error.value.code == 2
+        assert "--transcribe_batch_size must be >= 1" in capsys.readouterr().err
 
 
 def test_sequential_transcribe_explicitly_disables_batched_preset(monkeypatch, tmp_path: Path):

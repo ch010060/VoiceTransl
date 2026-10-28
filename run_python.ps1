@@ -9,7 +9,8 @@ param(
     [switch]$TranscribeOnly,
     [string]$InitialPrompt,
     [switch]$NoAsmrPrompt,
-    [switch]$DryRun
+    [switch]$DryRun,
+    [int]$TranscribeBatchSize
 )
 
 # Use the shared launcher for conda resolution, working directory and defaults.

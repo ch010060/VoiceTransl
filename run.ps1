@@ -9,7 +9,8 @@ param(
     [switch]$TranscribeOnly,
     [string]$InitialPrompt = "",
     [switch]$NoAsmrPrompt,
-    [switch]$DryRun
+    [switch]$DryRun,
+    [int]$TranscribeBatchSize = 12
 )
 
 $ErrorActionPreference = "Stop"
@@ -75,6 +76,7 @@ $arguments = @(
     $modeFlag,
     "--parallel", "$Parallel",
     "--transcribe_parallel", "$TranscribeParallel",
+    "--transcribe_batch_size", "$TranscribeBatchSize",
     "--translate_chunk_size", "$TranslateChunkSize"
 )
 
@@ -99,7 +101,7 @@ Write-Host "Input path: $inputPath"
 Write-Host "Mode: $modeFlag"
 Write-Host "Parallel: $Parallel  |  Transcribe parallel: $TranscribeParallel"
 Write-Host "Translate chunk size: $TranslateChunkSize"
-Write-Host "Transcription preset: $(if ($SequentialTranscribe) { 'sequential' } else { 'batched (batch_size=8, sentence=True, chunk_length=20)' })"
+Write-Host "Transcription preset: $(if ($SequentialTranscribe) { 'sequential' } else { "batched (batch_size=$TranscribeBatchSize, sentence=True, chunk_length=20)" })"
 Write-Host "Conda: $condaExe"
 Write-Host ""
 
