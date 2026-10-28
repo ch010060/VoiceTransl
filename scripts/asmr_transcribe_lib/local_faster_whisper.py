@@ -58,6 +58,8 @@ class FasterWhisperConfig:
     batched: bool = False
     batch_size: int = 16
     unmerged: bool = False
+    sentence: bool = False
+    chunk_length: int | None = None
     initial_prompt: str | None = None
     reprompt: bool = False
 
@@ -161,6 +163,10 @@ def build_faster_whisper_argv(
         argv += ["--batched", "--batch_size", str(config.batch_size)]
         if config.unmerged:
             argv += ["--unmerged"]
+        if config.chunk_length is not None:
+            argv += ["--chunk_length", str(config.chunk_length)]
+    if config.sentence:
+        argv += ["--sentence"]
     if config.initial_prompt is not None:
         argv += ["--initial_prompt", config.initial_prompt]
         if config.reprompt:

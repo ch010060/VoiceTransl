@@ -189,3 +189,39 @@ def test_builds_argv_with_batched_without_unmerged(tmp_path: Path):
 
     assert "--batched" in argv
     assert "--unmerged" not in argv
+
+
+def test_builds_argv_with_sentence_and_chunk_length(tmp_path: Path):
+    exe = tmp_path / "Faster-Whisper-XXL" / "faster-whisper-xxl.exe"
+    audio = tmp_path / "track.flac"
+    output_dir = tmp_path / "out"
+    exe.parent.mkdir(parents=True)
+    output_dir.mkdir(parents=True)
+    exe.write_text("exe", encoding="utf-8")
+    audio.write_text("audio", encoding="utf-8")
+    config = FasterWhisperConfig(model="large-v3", language="ja", batched=True, batch_size=8, sentence=True, chunk_length=20)
+
+    argv = build_faster_whisper_argv(exe, audio, output_dir, config)
+
+    assert argv[argv.index("--batch_size") + 1] == "8"
+    assert argv[argv.index("--chunk_length") + 1] == "20"
+    assert "--sentence" in argv
+    assert "--unmerged" not in argv
+
+
+def test_sequential_argv_has_no_batched_only_flags(tmp_path: Path):
+    exe = tmp_path / "Faster-Whisper-XXL" / "faster-whisper-xxl.exe"
+    audio = tmp_path / "track.flac"
+    output_dir = tmp_path / "out"
+    exe.parent.mkdir(parents=True)
+    output_dir.mkdir(parents=True)
+    exe.write_text("exe", encoding="utf-8")
+    audio.write_text("audio", encoding="utf-8")
+    # chunk_length only applies to batched mode
+    config = FasterWhisperConfig(model="large-v3", language="ja", chunk_length=20)
+
+    argv = build_faster_whisper_argv(exe, audio, output_dir, config)
+
+    assert "--chunk_length" not in argv
+    assert "--sentence" not in argv
+    assert "--batched" not in argv

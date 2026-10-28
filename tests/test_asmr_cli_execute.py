@@ -246,4 +246,37 @@ def test_cli_transcribe_only_skips_translation_preflight_and_translator(monkeypa
 
     assert exit_code == 0
     assert seen["translator"] is None
-    assert "Preflight translation API: skipped" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "Preflight translation API: skipped" in output
+    assert "Transcribed only (--transcribe_only): 1" in output
+
+
+def _capture_config(monkeypatch, tmp_path: Path, extra_args: list[str]):
+    root = tmp_path / "root"
+    audio = root / "work" / "track.wav"
+    audio.parent.mkdir(parents=True)
+    audio.write_text("audio", encoding="utf-8")
+    seen = {}
+
+    def fake_run_tasks(tasks, **kwargs):
+        seen["config"] = kwargs["faster_whisper_config"]
+        return []
+
+    monkeypatch.setattr(cli, "preflight_faster_whisper", lambda project_root: Path(project_root) / "fw.exe")
+    monkeypatch.setattr(cli, "preflight_faster_whisper_model", lambda project_root, model: None)
+    monkeypatch.setattr(cli, "preflight_model", lambda base_url, model: None)
+    monkeypatch.setattr(cli, "run_tasks", fake_run_tasks)
+    assert cli.main(["--path", str(root), "--execute", *extra_args]) == 0
+    return seen["config"]
+
+
+def test_fast_transcribe_uses_batched8_sentence_chunk20(monkeypatch, tmp_path: Path):
+    config = _capture_config(monkeypatch, tmp_path, ["--fast_transcribe"])
+
+    assert (config.batched, config.batch_size, config.sentence, config.chunk_length, config.unmerged) == (True, 8, True, 20, False)
+
+
+def test_default_transcribe_stays_sequential(monkeypatch, tmp_path: Path):
+    config = _capture_config(monkeypatch, tmp_path, [])
+
+    assert (config.batched, config.sentence, config.chunk_length) == (False, False, None)

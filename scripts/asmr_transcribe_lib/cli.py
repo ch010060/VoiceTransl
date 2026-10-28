@@ -46,6 +46,8 @@ DEFAULT_TRANSLATE_MODEL = "sakura-14b-qwen2.5-v1.0-q4km.gguf"
 DEFAULT_PARALLEL = 5
 DEFAULT_TRANSCRIBE_PARALLEL = 1
 DEFAULT_FASTER_WHISPER_PARAM = Path("whisper-faster") / "param.txt"
+FAST_BATCH_SIZE = 8
+FAST_CHUNK_LENGTH = 20
 # Sentinel stored in the transcription-progress map once a task moves on to translation.
 _TRANSLATING = (-1.0, 0.0, 0.0)
 
@@ -63,7 +65,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--kotoba_device", default="cuda", help="Device for the experimental Kotoba Python adapter; default uses CUDA.")
     parser.add_argument("--kotoba_chunk_length", type=int, default=15)
     parser.add_argument("--faster_whisper_param", default=str(DEFAULT_FASTER_WHISPER_PARAM), help="Project-local Faster Whisper command template file (display-only, does not alter the built command).")
-    parser.add_argument("--fast_transcribe", action="store_true", help="Speed preset: batched inference (batch_size=16, --unmerged). ~3.6x faster but lower quality — do NOT use for production subtitle output.")
+    parser.add_argument("--fast_transcribe", action="store_true", help="Speed preset: batched inference (batch_size=8, --sentence, --chunk_length 20). ~5.3x faster but ~5%% of text differs from the default sequential mode (some dropped/extra lines) — use for previews, not final subtitles.")
     parser.add_argument("--translate_chunk_size", type=int, default=20, help="Max SRT lines per translation request. 20 measured best for Sakura v1.0 (fewer line-count mismatches than 30 at equal or lower total time).")
     parser.add_argument("--initial_prompt", default=None, help="Custom Whisper decoder initial prompt. Overrides the built-in ASMR vocabulary prompt.")
     parser.add_argument("--no_asmr_prompt", action="store_true", help="Disable the built-in ASMR vocabulary prompt. Use when transcribing non-adult content.")
@@ -158,9 +160,12 @@ def main(argv: list[str] | None = None) -> int:
                 language=args.src_lang,
                 compute_type=args.transcribe_compute_type,
                 model_dir=find_faster_whisper_model_dir(project_root),
+                # fast preset measured 2026-10 on real ASMR: 5.3x faster, ~5% kana CER vs sequential.
+                # --sentence re-splits batched output into normal-length subtitles.
                 batched=args.fast_transcribe,
-                batch_size=16,
-                unmerged=args.fast_transcribe,
+                batch_size=FAST_BATCH_SIZE,
+                sentence=args.fast_transcribe,
+                chunk_length=FAST_CHUNK_LENGTH if args.fast_transcribe else None,
                 initial_prompt=effective_prompt,
                 reprompt=effective_prompt is not None,
             )
@@ -219,9 +224,12 @@ def print_results_summary(results: list[TaskResult]) -> None:
     skipped = sum(1 for result in results if result.status == "skipped")
     failed = sum(1 for result in results if result.status == "failed")
     copied = sum(1 for result in results if result.status == "copied")
+    transcribed = sum(1 for result in results if result.status == "transcribed")
     print(f"Results: {success} success | {skipped} skipped | {failed} failed")
     if copied:
         print(f"Copied existing subtitles: {copied}")
+    if transcribed:
+        print(f"Transcribed only (--transcribe_only): {transcribed}")
 
 
 def print_progress_snapshot(
