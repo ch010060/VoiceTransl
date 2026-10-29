@@ -16,3 +16,4 @@ bilibili-dl
 PyQt-Fluent-Widgets
 pyinstaller
 openai
+faster-whisper
