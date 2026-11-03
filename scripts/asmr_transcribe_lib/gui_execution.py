@@ -186,6 +186,18 @@ def run_plan(plan: ExecutionPlan, *, project_root: Path | str,
                 target = task.transcribe_srt_path if plan.mode == "transcribe_only" else task.final_srt_path
                 effective_task = replace(task, final_srt_path=target)
                 token.checkpoint()
+                if track.shared_output_owner:
+                    # The dependency has already published the single physical
+                    # output. This Track certifies a read, never copies/replaces.
+                    if (source_result.output_path is None or
+                            path_key(source_result.output_path) != path_key(target)):
+                        raise ValueError("shared output owner returned a different output")
+                    stage_changed("copy")
+                    token.checkpoint()
+                    validate_srt(target)
+                    receipts.append(make_provenance(plan, track.track_id, target,
+                                                   "transcription" if plan.mode == "transcribe_only" else "final"))
+                    return finish("copied", "shared_representative_output", target)
                 if task.existing_subtitle_path and path_key(task.existing_subtitle_path) == path_key(target):
                     stage_changed("copy")
                     token.checkpoint()
@@ -228,8 +240,23 @@ def run_plan(plan: ExecutionPlan, *, project_root: Path | str,
 
     for track in plan.planned_tracks:
         emit(PipelineEvent("track_queued", track.track_id, status="queued"))
+    # Stable dependency order within the existing scheduler's deferred-copy
+    # queue. Keep ordinals/IDs/result ordering from the frozen plan unchanged.
+    ordered, visited = [], set()
+    planned_ids = {t.track_id for t in plan.planned_tracks}
+    def visit(track):
+        if track.track_id in visited:
+            return
+        visited.add(track.track_id)
+        for dependency in track.dependencies:
+            if dependency not in planned_ids:
+                raise ValueError("dependency is outside planned execution")
+            visit(plan.track_index[dependency])
+        ordered.append(track.task)
+    for track in plan.planned_tracks:
+        visit(track)
     results = run_tasks(
-        [t.task for t in plan.planned_tracks], project_root=project_root,
+        ordered, project_root=project_root,
         faster_whisper_config=_config(plan, Path(project_root)), translator=translator,
         transcriber=transcriber, opencc_converter=opencc_converter,
         parallel=settings["parallel"], transcribe_parallel=settings["transcribe_parallel"],

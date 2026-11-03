@@ -16,14 +16,14 @@ from PyQt6.QtCore import QObject, QTimer, Qt, pyqtSignal
 
 from scripts.asmr_gui_runtime import ManagedOperation, ManagedWorker
 from scripts.asmr_gui_worker import default_state_root
-from scripts.asmr_transcribe_lib.gui_plan import build_execution_plan, file_stamp
+from scripts.asmr_transcribe_lib.gui_plan import PlanRejected, build_execution_plan, file_stamp
 from scripts.asmr_transcribe_lib.gui_plan_io import encode_plan, load_plan, save_plan
 from scripts.asmr_transcribe_lib.gui_protocol import JSONLDecoder, ProtocolError
 from scripts.asmr_transcribe_lib.gui_results import (
     atomic_json, read_json, reconcile_run, resume_provenance, safe_ref,
 )
 from .run_model import RunModel
-from .diagnostics import DiagnosticLog
+from .diagnostics import DiagnosticLog, plan_rejection_diagnostic
 from .health import HealthMonitor
 
 BUSY = {"SCANNING", "PREFLIGHT", "STARTING", "RUNNING", "STOPPING", "RECONCILING", "CLEANUP_FAILED"}
@@ -393,16 +393,28 @@ class Controller(QObject):
         # The new plan is rejected if catalog/group membership changed underneath.
         if any(file_stamp(path) != stamp for path, stamp in intent.catalog.inventory):
             raise ValueError("catalog inventory changed; rescan required")
-        encode_plan(intent.catalog)
+        try:
+            encode_plan(intent.catalog)
+        except PlanRejected as exc:
+            exc.diagnostic_origin = "catalog_freshness_validation"
+            raise
         if intent.stop.is_set():
             return None
-        plan = build_execution_plan(intent.root, mode=intent.mode,
-            selected_work_ids=intent.selected, limit=intent.limit,
-            settings=json.loads(intent.settings_json), provenance=self._provenance(intent), skip_existing_subtitles=True)
+        try:
+            plan = build_execution_plan(intent.root, mode=intent.mode,
+                selected_work_ids=intent.selected, limit=intent.limit,
+                settings=json.loads(intent.settings_json), provenance=self._provenance(intent), skip_existing_subtitles=True)
+        except PlanRejected as exc:
+            exc.diagnostic_origin = "plan_construction"
+            raise
         old = [(track.track_id, track.source_stamp) for track in intent.catalog.tracks]
         if old != [(track.track_id, track.source_stamp) for track in plan.tracks] or intent.catalog.duplicate_groups != plan.duplicate_groups:
             raise ValueError("catalog changed; rescan required")
-        plan.assert_ready()
+        try:
+            plan.assert_ready()
+        except PlanRejected as exc:
+            exc.diagnostic_origin = "plan_construction" if plan.issues else "start_freshness_validation"
+            raise
         return plan
 
     def _preflight(self, intent, plan):
@@ -563,6 +575,19 @@ class Controller(QObject):
             retained = self._owned is not None
         if retained:
             self._post(intent, "cleanup_failed", {"cleanup_verified": False, "error": code})
+        elif isinstance(exc, PlanRejected):
+            report, summary = plan_rejection_diagnostic(intent, exc)
+            destination = self.state_root / "diagnostics" / ("plan-rejected-" + intent.operation_id + ".json")
+            try:
+                if destination.resolve().is_relative_to(Path(intent.root).resolve()):
+                    raise ValueError("diagnostics must be outside library")
+                atomic_json(destination, report)
+                location = "diagnostic=diagnostics/" + destination.name
+            except (OSError, ValueError):
+                # Diagnostic failure must never turn a rejected plan into a run,
+                # or bypass the retained-owner cleanup branch above.
+                location = "diagnostic=unavailable"
+            self._post(intent, "error", code + ":PlanRejected · " + summary + " · " + location)
         else:
             self._post(intent, "error", code + ":" + type(exc).__name__)
 

@@ -8,7 +8,7 @@ from uuid import UUID, uuid5
 from .gui_plan import (
     APP_NAMESPACE, DuplicateGroup, ExecutionPlan, PlanIssue, PlanRejected,
     PlannedTrack, PlannedWork, COMMON_SUBTITLE_EXTENSIONS, _hash, _namespace_issues,
-    is_existing_subtitle_skip, path_key,
+    is_existing_subtitle_skip, path_key, _shared_output_owners,
 )
 from .gui_results import atomic_json, read_json
 from .models import AudioTask
@@ -31,6 +31,9 @@ def _json_value(value):
 
 
 def _record(cls, value):
+    # Older v1 plans have no non-representative shared-output readers.
+    if cls is PlannedTrack and isinstance(value, dict) and "shared_output_owner" not in value:
+        value = {**value, "shared_output_owner": None}
     if not isinstance(value, dict) or set(value) != {field.name for field in fields(cls)}:
         raise PlanTransportError("invalid frozen plan record")
     return dict(value)
@@ -55,6 +58,8 @@ def _plan_hash(plan):
         "settings": plan.settings, "selected": plan.selected_work_ids,
         "excluded": plan.excluded_track_ids,
         "tracks": [(t.track_id, t.task.action, t.dependencies, t.verification) for t in plan.tracks],
+        **({"shared_output_owners": [(t.track_id, t.shared_output_owner) for t in plan.tracks if t.shared_output_owner]}
+           if any(t.shared_output_owner for t in plan.tracks) else {}),
         **({"existing_subtitles": [(t.track_id, path_key(t.task.existing_subtitle_path))
                                    for t in plan.tracks if is_existing_subtitle_skip(t.task)]}
            if plan.settings.get("gui_existing_subtitles") == "skip_common" else {}),
@@ -124,7 +129,7 @@ def _validate(plan):
             raise PlanTransportError("invalid frozen action or representative")
         if len(track.dependencies) > 1 or any(dep not in tracks or dep == track.track_id or tracks[dep].work_id != track.work_id for dep in track.dependencies):
             raise PlanTransportError("invalid Track dependency")
-        if task.action == "copy_duplicate_audio_subtitle" and track.dependencies != (group.representative_track_id,):
+        if task.action == "copy_duplicate_audio_subtitle" and track.dependencies != (track.shared_output_owner or group.representative_track_id,):
             raise PlanTransportError("duplicate dependency changed")
         if task.existing_subtitle_path and not resolved_path(task.existing_subtitle_path).is_relative_to(resolved_path(task.work_dir)):
             raise PlanTransportError("subtitle dependency escapes Work")
@@ -155,6 +160,10 @@ def _validate(plan):
             seen.add(dependency)
             pending.extend(tracks[dependency].dependencies)
     selected = [t for t in plan.tracks if t.work_id in plan.selected_work_ids]
+    expected_owners = _shared_output_owners(plan.tracks, plan.duplicate_groups)
+    actual_owners = {t.track_id: t.shared_output_owner for t in plan.tracks if t.shared_output_owner}
+    if actual_owners != expected_owners:
+        raise PlanTransportError("shared output ownership changed")
     if plan.source_inventory_fingerprint != _hash([(t.track_id, t.source_stamp) for t in selected]):
         raise PlanTransportError("source fingerprint mismatch")
     for path, stamp in plan.inventory:

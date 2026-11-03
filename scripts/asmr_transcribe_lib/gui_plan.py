@@ -140,6 +140,7 @@ class PlannedTrack:
     dependencies: tuple[str, ...] = ()
     representative_track_id: str | None = None
     verification: str = "fresh"
+    shared_output_owner: str | None = None
 
 
 @dataclass(frozen=True)
@@ -229,6 +230,31 @@ def _output_paths(task: AudioTask) -> tuple[tuple[str, Path], ...]:
             ("translation", task.translate_srt_path), ("opencc", task.opencc_srt_path))
 
 
+def _shared_output_owners(tracks, groups):
+    """Only non-representative duplicate copies with identical stage namespaces.
+
+    Representative aliases already use the established read-only copy path.
+    This adds a single copy owner for another physical namespace in that group.
+    Never coalesce different groups, Works, stage roles, or legacy skip actions.
+    """
+    by_id = {t.track_id: t for t in tracks}
+    owners = {}
+    for group in groups:
+        classes = {}
+        for member in group.members:
+            track = by_id[member]
+            signature = tuple(path_key(p) for _, p in _output_paths(track.task))
+            classes.setdefault(signature, []).append(track)
+        for members in classes.values():
+            if (len(members) < 2 or any(t.track_id == group.representative_track_id for t in members)
+                    or any(t.task.action != "copy_duplicate_audio_subtitle" for t in members)):
+                continue
+            chosen = _choose_representative_audio([t.task for t in members], members[0].task.work_dir)
+            owner = next(t.track_id for t in members if t.task.audio_path == chosen.audio_path)
+            owners.update((t.track_id, owner) for t in members if t.track_id != owner)
+    return owners
+
+
 def _namespace_uses(tracks: tuple[PlannedTrack, ...], groups: tuple[DuplicateGroup, ...], mode: str) -> tuple[OutputUse, ...]:
     by_id = {t.track_id: t for t in tracks}
     aliases = {}
@@ -243,6 +269,12 @@ def _namespace_uses(tracks: tuple[PlannedTrack, ...], groups: tuple[DuplicateGro
                             aliases[(member, role)] = group.representative_track_id
     uses = []
     for track in tracks:
+        if track.shared_output_owner:
+            role = "transcription" if mode == "transcribe_only" else "final"
+            output = dict(_output_paths(track.task))[role]
+            uses.append(OutputUse(output, role, track.track_id, track.shared_output_owner, "read"))
+            uses.append(OutputUse(track.task.audio_path, "source_audio", track.track_id, track.track_id, "read"))
+            continue
         if is_existing_subtitle_skip(track.task):
             source = track.task.existing_subtitle_path
             if source:
@@ -399,6 +431,13 @@ def build_execution_plan(root: Path | str, *, mode: str = "full",
         adjusted.append(replace(track, task=task, dependencies=dependencies,
                                 representative_track_id=group.representative_track_id))
     tracks = tuple(adjusted)
+    shared_owners = _shared_output_owners(tracks, tuple(groups))
+    by_id = {t.track_id: t for t in tracks}
+    role = "transcription" if mode == "transcribe_only" else "final"
+    tracks = tuple(replace(t, shared_output_owner=shared_owners[t.track_id],
+                           dependencies=(shared_owners[t.track_id],),
+                           task=replace(t.task, existing_subtitle_path=dict(_output_paths(by_id[shared_owners[t.track_id]].task))[role]))
+                   if t.track_id in shared_owners else t for t in tracks)
     works = tuple(PlannedWork(work_ids[p], kind, name, tuple(t.track_id for t in tracks_by_work.get(p, [])))
                   for p, kind, name in work_paths)
     selected = tuple(w.work_id for w in works) if selected_work_ids is None else tuple(selected_work_ids)
@@ -461,7 +500,9 @@ def build_execution_plan(root: Path | str, *, mode: str = "full",
             if task.action in {"copy_existing_subtitle", "copy_duplicate_audio_subtitle"}:
                 target = task.transcribe_srt_path if mode == "transcribe_only" else task.final_srt_path
                 kind = "transcription" if mode == "transcribe_only" else "final"
-                if target.exists() and not _verified(track, target, kind, settings_hash, proof):
+                verified_owner = (track.shared_output_owner and
+                                  _verified(by_id[track.shared_output_owner], target, kind, settings_hash, proof))
+                if target.exists() and not (_verified(track, target, kind, settings_hash, proof) or verified_owner):
                     verification = "unverified_legacy"
                     issues.append(PlanIssue("UNVERIFIED_LEGACY", (track.track_id,), (target,), "copy target lacks matching provenance"))
         verified_tracks.append(replace(track, verification=verification))
@@ -476,6 +517,8 @@ def build_execution_plan(root: Path | str, *, mode: str = "full",
     inventory_hash = _hash([(t.track_id, t.source_stamp) for t in selected_tracks])
     plan_hash = _hash({"settings": effective, "selected": selected, "excluded": excluded,
                        "tracks": [(t.track_id, t.task.action, t.dependencies, t.verification) for t in tracks],
+                       **({"shared_output_owners": [(t.track_id, t.shared_output_owner) for t in tracks if t.shared_output_owner]}
+                          if any(t.shared_output_owner for t in tracks) else {}),
                        **({"existing_subtitles": [(t.track_id, path_key(t.task.existing_subtitle_path))
                                                   for t in tracks if is_existing_subtitle_skip(t.task)]}
                           if skip_existing_subtitles else {}),

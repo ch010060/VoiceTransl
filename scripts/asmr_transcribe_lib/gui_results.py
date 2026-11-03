@@ -76,6 +76,7 @@ def _identity(track, mode, settings_hash) -> dict:
     if is_existing_subtitle_skip(track.task):
         role, output = "existing_subtitle", track.task.existing_subtitle_path
     return {"track_id": track.track_id, "work_id": track.work_id, "source_stamp": list(track.source_stamp),
+            **({"shared_output_owner": track.shared_output_owner} if track.shared_output_owner else {}),
             "settings_hash": settings_hash, "output_type": role, "output_key": path_key(output),
             "verification": track.verification}
 
@@ -192,6 +193,8 @@ class RunStore:
                           "catalog_ref": "plan:work:" + work.work_id})
 
     def _terminal_receipt(self, event, track):
+        if track.shared_output_owner and event.status in {"success", "transcribed", "skipped"}:
+            raise ProtocolError("shared output reader must report copied")
         identity = self.identities[track.track_id]
         provenance = None
         output_hash = None
@@ -235,6 +238,18 @@ class RunStore:
                    "error_code": "TRACK_EXECUTION_FAILED" if event.status == "failed" else None,
                    "dependencies": list(track.dependencies),
                    "revision": self.state["tracks"][track.track_id]["revision"] + 1}
+        if track.shared_output_owner and event.status == "copied":
+            owner_state = self.state["tracks"][track.shared_output_owner]
+            if not owner_state.get("receipt_ref"):
+                raise ProtocolError("shared output owner lacks a terminal receipt")
+            owner_receipt = _verify_receipt(self.run_dir, self.manifest, track.shared_output_owner, owner_state)
+            if (owner_receipt["status"] not in {"success", "transcribed", "copied", "skipped"}
+                    or owner_receipt["output_key"] != identity["output_key"]
+                    or owner_receipt["output_type"] != identity["output_type"]
+                    or owner_receipt["output_hash"] != output_hash):
+                raise ProtocolError("shared output differs from owner receipt")
+            receipt["shared_output_receipt"] = {key: owner_state[key] for key in
+                                                ("receipt_ref", "receipt_hash", "status", "revision")}
         ref = "receipts/" + track.track_id + ".json"
         atomic_json(safe_ref(self.run_dir, ref), receipt)
         self.state["tracks"][track.track_id].update(receipt_ref=ref, receipt_hash=_digest(receipt))
@@ -397,6 +412,22 @@ def _verify_receipt(run_dir, manifest, track_id, stored):
             expected_proof["output_hash"] = actual_hash
             if proof != expected_proof:
                 raise ProtocolError("receipt provenance mismatch")
+        owner_id = expected.get("shared_output_owner")
+        if owner_id:
+            owner = manifest["tracks"].get(owner_id)
+            link = receipt.get("shared_output_receipt")
+            if (status != "copied" or not owner or owner.get("shared_output_owner")
+                    or owner["work_id"] != expected["work_id"]
+                    or owner["output_key"] != expected["output_key"]
+                    or owner["output_type"] != expected["output_type"]
+                    or receipt.get("dependencies") != [owner_id] or not isinstance(link, dict)
+                    or set(link) != {"receipt_ref", "receipt_hash", "status", "revision"}
+                    or link["receipt_ref"] != "receipts/" + owner_id + ".json"):
+                raise ProtocolError("invalid shared output receipt dependency")
+            owner_receipt = _verify_receipt(run_dir, manifest, owner_id, link)
+            if (owner_receipt["status"] not in {"success", "transcribed", "copied", "skipped"}
+                    or owner_receipt["output_hash"] != actual_hash):
+                raise ProtocolError("shared output owner did not complete")
     return receipt
 
 
