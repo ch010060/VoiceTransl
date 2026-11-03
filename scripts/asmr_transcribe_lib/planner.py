@@ -161,6 +161,10 @@ def _content_stem_key(stem: str) -> str:
     normalized = re.sub(r"^[\s_\-－–—]*[【\[\(（]?\s*se\s*(?:なし|無し|ナシ|無)[】\]\)）]?[\s_\-－–—]*", "", normalized)
     normalized = re.sub(r"[\s_\-－–—]*[【\[\(（]\s*se\s*(?:なし|無し|ナシ|無)\s*[】\]\)）]\s*$", "", normalized)
     normalized = re.sub(r"[\s_\-－–—]+se\s*(?:なし|無し|ナシ|無)\s*$", "", normalized)
+    # SEcut is a mastering variant of the same named base track. Match only a
+    # complete trailing tag, never an arbitrary word containing 'secut'.
+    normalized = re.sub(r"[\s_\-－–—]*[\(（\[【]\s*se\s*cut\s*[\)）\]】]\s*$", "", normalized)
+    normalized = re.sub(r"[\s_\-－–—]+se\s*cut\s*$", "", normalized)
     return normalized.strip(" _-－–—")
 
 

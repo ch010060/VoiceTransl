@@ -208,6 +208,7 @@ def test_cli_execute_reports_preflight_error_without_traceback(monkeypatch, tmp_
     audio.parent.mkdir(parents=True)
     audio.write_text("audio", encoding="utf-8")
 
+    monkeypatch.setattr(cli, "preflight_model", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(cli, "preflight_faster_whisper", lambda project_root: Path(project_root) / "fw.exe")
 
     def fail_model_preflight(project_root, model):

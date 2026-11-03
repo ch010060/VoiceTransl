@@ -14,3 +14,8 @@ faster-whisper*/
 build/
 dist/
 whisper-faster/whisper-faster.exe
+
+# Local historical test/evidence/benchmark artifacts (inventory before removal).
+/.asmr_*/
+/.tmp_phase*/
+/.pytest_cache/

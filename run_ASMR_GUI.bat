@@ -1,0 +1,1 @@
+conda run --no-capture-output -n asmr python -B scripts/asmr_batch_gui.py
