@@ -13,6 +13,7 @@ from .gui_plan import (
 from .gui_results import atomic_json, read_json
 from .models import AudioTask
 from .planner import AUDIO_EXTENSIONS
+from .scan_cache import resolved_path, scan_phase
 
 
 class PlanTransportError(ValueError):
@@ -35,6 +36,7 @@ def _record(cls, value):
     return dict(value)
 
 
+@scan_phase(fresh=True)
 def _audio_membership(plan):
     """Validate selected directory membership without invoking the matcher."""
     paths = set()
@@ -62,6 +64,7 @@ def _plan_hash(plan):
     })
 
 
+@scan_phase
 def _validate(plan):
     """Check transport identity/graph/path consistency without changing policy."""
     if not plan.root.is_absolute() or plan.mode not in {"full", "transcribe_only"}:
@@ -104,17 +107,17 @@ def _validate(plan):
     for ordinal, track in enumerate(plan.tracks):
         task = track.task
         relative = task.audio_path.relative_to(plan.root)
-        if not task.audio_path.is_absolute() or not task.audio_path.resolve().is_relative_to(plan.root.resolve()) or task.audio_path.suffix.lower() not in AUDIO_EXTENSIONS:
+        if not task.audio_path.is_absolute() or not resolved_path(task.audio_path).is_relative_to(resolved_path(plan.root)) or task.audio_path.suffix.lower() not in AUDIO_EXTENSIONS:
             raise PlanTransportError("audio path escapes frozen root")
         if track.ordinal != ordinal or track.track_id != str(uuid5(UUID(plan.root_id), "track/" + relative.as_posix())) or task.relative_audio_path != relative or task.root_relative_audio_path != relative:
             raise PlanTransportError("invalid Track identity")
         work = next((w for w in plan.works if w.work_id == track.work_id), None)
-        if work is None or task.work_dir != plan.root / work.relative_path or not task.audio_path.resolve().is_relative_to(task.work_dir.resolve()):
+        if work is None or task.work_dir != plan.root / work.relative_path or not resolved_path(task.audio_path).is_relative_to(resolved_path(task.work_dir)):
             raise PlanTransportError("Track outside Work")
         expected = (task.audio_path.with_suffix(".srt"),) + tuple(task.audio_path.with_name(task.audio_path.stem + suffix) for suffix in ("-transcribe.srt", "-translate.srt", "-opencc.srt"))
         if expected != (task.final_srt_path, task.transcribe_srt_path, task.translate_srt_path, task.opencc_srt_path):
             raise PlanTransportError("output namespace changed")
-        if any(not path.resolve().is_relative_to(plan.root.resolve()) for path in expected):
+        if any(not resolved_path(path).is_relative_to(resolved_path(plan.root)) for path in expected):
             raise PlanTransportError("output namespace escapes root")
         group = groups.get(track.track_id)
         if group is None or track.representative_track_id != group.representative_track_id or task.action not in {"process", "skip", "copy_existing_subtitle", "copy_duplicate_audio_subtitle"}:
@@ -123,7 +126,7 @@ def _validate(plan):
             raise PlanTransportError("invalid Track dependency")
         if task.action == "copy_duplicate_audio_subtitle" and track.dependencies != (group.representative_track_id,):
             raise PlanTransportError("duplicate dependency changed")
-        if task.existing_subtitle_path and not task.existing_subtitle_path.resolve().is_relative_to(task.work_dir.resolve()):
+        if task.existing_subtitle_path and not resolved_path(task.existing_subtitle_path).is_relative_to(resolved_path(task.work_dir)):
             raise PlanTransportError("subtitle dependency escapes Work")
         if is_existing_subtitle_skip(task):
             source = task.existing_subtitle_path
@@ -155,12 +158,13 @@ def _validate(plan):
     if plan.source_inventory_fingerprint != _hash([(t.track_id, t.source_stamp) for t in selected]):
         raise PlanTransportError("source fingerprint mismatch")
     for path, stamp in plan.inventory:
-        if not path.resolve().is_relative_to(plan.root.resolve()) or not stamp or stamp[0] != path_key(path):
+        if not resolved_path(path).is_relative_to(resolved_path(plan.root)) or not stamp or stamp[0] != path_key(path):
             raise PlanTransportError("invalid inventory path")
     if _namespace_issues(plan.planned_tracks, plan.duplicate_groups, plan.mode) and not plan.issues:
         raise PlanTransportError("unsafe frozen output namespace")
 
 
+@scan_phase
 def encode_plan(plan: ExecutionPlan) -> dict:
     _validate(plan)
     expected = sorted(path_key(t.task.audio_path) for t in plan.tracks if t.work_id in plan.selected_work_ids)
@@ -170,6 +174,7 @@ def encode_plan(plan: ExecutionPlan) -> dict:
     return {**payload, "transport_hash": _hash(payload)}
 
 
+@scan_phase
 def decode_plan(document: dict, expected_digest: str | None = None) -> ExecutionPlan:
     try:
         if not isinstance(document, dict) or set(document) != {"schema_version", "plan", "audio_membership", "transport_hash"} or document["schema_version"] != "1.0":

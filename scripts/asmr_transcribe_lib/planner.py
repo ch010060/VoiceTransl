@@ -7,6 +7,7 @@ import re
 import unicodedata
 
 from .models import AudioTask
+from .scan_cache import current_phase
 
 AUDIO_EXTENSIONS = {".mp3", ".flac", ".wav"}
 ALTERNATE_SUBTITLE_EXTENSIONS = (".vtt", ".ass", ".ssa", ".lrc")
@@ -88,6 +89,10 @@ def _dedupe_same_stem_audio(tasks: list[AudioTask], work_dir: Path) -> list[Audi
 def _group_same_content_tasks(tasks: list[AudioTask]) -> list[list[AudioTask]]:
     if not tasks:
         return []
+    phase = current_phase()
+    identity = tuple(task.audio_path for task in tasks)
+    if phase is not None and identity in phase.groups:
+        return [[tasks[index] for index in row] for row in phase.groups[identity]]
 
     keys = [_content_stem_key(task.audio_path.stem) for task in tasks]
     parents = list(range(len(tasks)))
@@ -109,10 +114,13 @@ def _group_same_content_tasks(tasks: list[AudioTask]) -> list[list[AudioTask]]:
             if _same_content_task(tasks[left], keys[left], tasks[right], keys[right]):
                 union(left, right)
 
-    grouped: dict[int, list[AudioTask]] = {}
-    for index, task in enumerate(tasks):
-        grouped.setdefault(find(index), []).append(task)
-    return list(grouped.values())
+    grouped: dict[int, list[int]] = {}
+    for index in range(len(tasks)):
+        grouped.setdefault(find(index), []).append(index)
+    rows = tuple(tuple(row) for row in grouped.values())
+    if phase is not None:
+        phase.groups[identity] = rows
+    return [[tasks[index] for index in row] for row in rows]
 
 
 def _same_content_task(left_task: AudioTask, left_key: str, right_task: AudioTask, right_key: str) -> bool:

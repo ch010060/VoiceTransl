@@ -11,6 +11,7 @@ from dataclasses import dataclass, replace
 import hashlib
 import json
 import os
+import stat as stat_module
 from pathlib import Path
 from functools import cached_property
 from types import MappingProxyType
@@ -21,6 +22,7 @@ from .planner import (
     discover_audio_tasks, _choose_representative_audio, _group_same_content_tasks,
 )
 from .srt_utils import parse_srt_file
+from .scan_cache import current_phase, resolved_path, scan_phase
 
 APP_NAMESPACE = UUID("5f3ddd82-3f63-4fb0-9ec4-fc9d8d62a501")
 COMMON_SUBTITLE_EXTENSIONS = (".srt", ".vtt", ".ass", ".ssa", ".lrc")
@@ -32,22 +34,34 @@ def _hash(value: object) -> str:
 
 
 def path_key(path: Path) -> str:
-    return os.path.normcase(str(path.resolve()))
+    return os.path.normcase(str(resolved_path(path)))
 
 
 def file_stamp(path: Path) -> tuple:
-    if not path.exists():
+    try:
+        stat = path.stat()
+    except (FileNotFoundError, NotADirectoryError):
         return (path_key(path), None)
-    stat = path.stat()
     # Audio identity/freshness metadata only: NOT an equivalence gate for variants.
-    digest = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() and path.suffix.lower() in {*COMMON_SUBTITLE_EXTENSIONS, ".tmp"} else None
+    digest = hashlib.sha256(path.read_bytes()).hexdigest() if stat_module.S_ISREG(stat.st_mode) and path.suffix.lower() in {*COMMON_SUBTITLE_EXTENSIONS, ".tmp"} else None
     return (path_key(path), stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, digest)
 
 
 def _existing_common_subtitle(task: AudioTask) -> Path | None:
-    candidates = [path for path in task.audio_path.parent.iterdir()
-                  if path.stem.casefold() == task.audio_path.stem.casefold()
-                  and path.suffix.lower() in COMMON_SUBTITLE_EXTENSIONS]
+    parent = task.audio_path.parent
+    phase = current_phase()
+    if phase is None:
+        candidates = [path for path in parent.iterdir()
+                      if path.stem.casefold() == task.audio_path.stem.casefold()
+                      and path.suffix.lower() in COMMON_SUBTITLE_EXTENSIONS]
+    else:
+        if parent not in phase.subtitles:
+            index = {}
+            for path in parent.iterdir():
+                if path.suffix.lower() in COMMON_SUBTITLE_EXTENSIONS:
+                    index.setdefault(path.stem.casefold(), []).append(path)
+            phase.subtitles[parent] = index
+        candidates = phase.subtitles[parent].get(task.audio_path.stem.casefold(), ())
     return min(candidates, key=lambda path: (COMMON_SUBTITLE_EXTENSIONS.index(path.suffix.lower()),
                                            path.name.casefold(), path.name), default=None)
 
@@ -290,6 +304,7 @@ def _namespace_issues(tracks: tuple[PlannedTrack, ...], groups: tuple[DuplicateG
     return issues
 
 
+@scan_phase
 def build_execution_plan(root: Path | str, *, mode: str = "full",
                          selected_work_ids: Iterable[str] | None = None,
                          limit: int | None = None, settings: Mapping | None = None,
@@ -301,7 +316,7 @@ def build_execution_plan(root: Path | str, *, mode: str = "full",
         raise ValueError("limit must be >= 1")
     if not isinstance(skip_existing_subtitles, bool):
         raise ValueError("skip_existing_subtitles must be boolean")
-    root = Path(root).expanduser().resolve()
+    root = resolved_path(Path(root).expanduser())
     tasks = discover_audio_tasks(root)
     # Import only at call time: CLI owns defaults; it does not import this planner.
     from .cli import FAST_CHUNK_LENGTH, _effective_initial_prompt, _effective_transcribe_model, build_parser
@@ -413,8 +428,8 @@ def build_execution_plan(root: Path | str, *, mode: str = "full",
             source = task.existing_subtitle_path
             if is_existing_subtitle_skip(task):
                 if (not source or not source.is_file()
-                        or not source.resolve().is_relative_to(task.work_dir.resolve())
-                        or not source.resolve().is_relative_to(root)):
+                        or not resolved_path(source).is_relative_to(resolved_path(task.work_dir))
+                        or not resolved_path(source).is_relative_to(root)):
                     issues.append(PlanIssue("INVALID_EXISTING_SUBTITLE", (track.track_id,),
                                             (source,) if source else (), "existing subtitle is not a file within the Work"))
             for dependency in track.dependencies:
