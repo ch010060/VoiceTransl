@@ -181,3 +181,17 @@ def test_invalid_protocol_text_is_not_displayed(tmp_path):
         "error": {"code": "PRIVATE_CAPTION token=PRIVATE_SECRET", "detail_ref": "https://secret.invalid"}}))
     text = str(lines)
     assert "PRIVATE_CAPTION" not in text and "PRIVATE_SECRET" not in text and "secret.invalid" not in text
+
+
+def test_repaired_timestamp_success_has_truthful_readable_warning(tmp_path):
+    from test_asmr_gui_srt_normalization import RAW
+    from scripts.asmr_transcribe_lib.srt_normalization import WARNING_CODE
+    plan = build_execution_plan(library(tmp_path, variants=False))
+    def asr(*, transcribe_srt_path, **kwargs):
+        transcribe_srt_path.write_bytes(RAW)
+        return transcribe_srt_path
+    store, outcomes, result = execute(plan, tmp_path / "run", asr=asr)
+    assert result["outcome"] == "completed" and outcomes[0].warnings == (WARNING_CODE,)
+    text = (store.run_dir / "logs/execution.log").read_text(encoding="utf-8")
+    assert WARNING_CODE in text and "完成翻譯" in text and "DEFERRED" not in text
+    assert "Synthetic" not in text

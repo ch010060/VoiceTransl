@@ -1,6 +1,13 @@
 """Curated execution failures; never retain exception messages or subtitle text."""
 from pathlib import Path
 import re
+from .srt_normalization import TimestampOrderError
+
+NORMALIZATION_REJECTIONS = {
+    "empty", "index", "timestamp_range", "format", "end_before_start",
+    "displacement_limit", "repair_exceeds_end", "count_limit", "ratio_limit",
+    "serialization", "strict_validation", "audit_store_required",
+}
 
 ERROR_REASONS = {
     "ASR_PROCESS_FAILED": "語音辨識程序未正常完成",
@@ -53,6 +60,8 @@ def curate_failure(value, stage):
                     and (example.get("previous_timestamp") is None or re.fullmatch(timing, str(example["previous_timestamp"])))):
                 examples.append({k: example[k] for k in ("segment", "timestamp", "previous_timestamp", "backward_ms")})
         details = {"anomaly_count": raw["anomaly_count"], "examples": examples, "automatic_repair": "DEFERRED"}
+    if isinstance(raw, dict) and raw.get("normalization_rejection") in NORMALIZATION_REJECTIONS:
+        details.update(normalization_rejection=raw["normalization_rejection"], automatic_repair="REJECTED")
     return failure_record(value.get("code", "TRACK_EXECUTION_FAILED"), stage, exception_type=kind, details=details)
 
 
@@ -60,7 +69,9 @@ def srt_failure(error, path):
     """On failure only, retain numeric timing evidence without any caption text."""
     code = "SRT_VALIDATION_FAILED"
     details = {}
-    if error.args == ("SRT timestamps out of order",):
+    rejected = isinstance(error, TimestampOrderError)
+    if error.args == ("SRT timestamps out of order",) or rejected and error.category in {
+            "end_before_start", "displacement_limit", "repair_exceeds_end", "count_limit", "ratio_limit"}:
         code = "SRT_TIMESTAMP_ORDER_INVALID"
         from .srt_utils import parse_srt_file
         previous = None
@@ -77,4 +88,7 @@ def srt_failure(error, path):
                                 "backward_ms": max(0, previous[0] - left) if previous else 0})
             previous = (left, block.timestamp)
         details = {"anomaly_count": len(defects), "examples": defects[:5], "automatic_repair": "DEFERRED"}
+    if rejected:
+        code = "SRT_TIMESTAMP_ORDER_INVALID"
+        details.update(normalization_rejection=error.category, automatic_repair="REJECTED")
     return ExecutionFailure(code, error, details)

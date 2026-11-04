@@ -42,7 +42,8 @@ def execute(plan, directory, *, asr=None, translate=None, convert=None, observer
             observer(event, store)
     outcomes = run_plan(plan, project_root=directory.parent, transcriber=asr or transcription,
                         translator=(translate or copy) if plan.mode == "full" else None,
-                        opencc_converter=convert or copy, observer=observe, cancel_token=token)
+                        opencc_converter=convert or copy, observer=observe, cancel_token=token,
+                        normalization_store=store.record_normalization)
     result = store.finish(outcomes)
     return store, outcomes, result
 
@@ -103,7 +104,7 @@ def test_timestamp_repair_deferred_original_text_and_order_preserved(tmp_path, t
     if not valid:
         error = read_json(store.run_dir / "receipts" / (plan.tracks[0].track_id + ".json"))["error"]
         assert error["code"] == "SRT_TIMESTAMP_ORDER_INVALID"
-        assert error["details"]["automatic_repair"] == "DEFERRED"
+        assert error["details"]["automatic_repair"] == "REJECTED"
         if len(timings) == 3:
             assert error["details"]["anomaly_count"] == 2
         if "12:05" in timings[0]:

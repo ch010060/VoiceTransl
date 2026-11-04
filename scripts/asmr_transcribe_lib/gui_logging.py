@@ -7,6 +7,7 @@ import re
 import threading
 
 from .gui_errors import ERROR_REASONS
+from .srt_normalization import WARNING_CODE
 
 
 class DiagnosticLog:
@@ -165,6 +166,8 @@ class RunLogFormatter:
                     context += " diagnostic=" + reference
             elif status in {"cancelled", "not_started"}:
                 message += " · " + {"dependency_failed": "依賴失敗", "run_cancelled": "使用者停止", "run_aborted": "執行中斷"}.get(payload.get("reason"), "原因待核對")
+            if WARNING_CODE in payload.get("warnings", []):
+                message += " · " + WARNING_CODE + "（時間軸已受限正規化，證據見收據）"
             context += f" status={status} receipt={payload['receipt_id']} duration={duration}"
             lines.append((f"{title} {message} · {duration}", context))
             lines.extend(self._work_summary(track.work_id, prefix, context))
