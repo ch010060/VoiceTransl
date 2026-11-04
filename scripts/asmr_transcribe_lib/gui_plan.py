@@ -354,10 +354,16 @@ def build_execution_plan(root: Path | str, *, mode: str = "full",
     from .cli import FAST_CHUNK_LENGTH, _effective_initial_prompt, _effective_transcribe_model, build_parser
     parser = build_parser()
     effective = vars(parser.parse_args(["--path", str(root)]))
+    effective["keep_intermediate_files"] = False
     actions = {action.dest: action for action in parser._actions}
     for key, value in (settings or {}).items():
         if key not in effective or key in {"path", "execute", "dry_run", "limit", "transcribe_only"}:
             raise ValueError(f"unsupported plan setting: {key}")
+        if key == "keep_intermediate_files":
+            if type(value) is not bool:
+                raise ValueError("keep_intermediate_files must be boolean")
+            effective[key] = value
+            continue
         action = actions[key]
         if isinstance(effective[key], bool) and not isinstance(value, bool):
             raise ValueError(f"{key} must be boolean")

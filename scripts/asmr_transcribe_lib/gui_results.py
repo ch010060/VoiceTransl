@@ -12,6 +12,7 @@ import threading
 import time
 from uuid import uuid4
 
+from .gui_cleanup import IntermediateCleanup, WARNING as CLEANUP_WARNING
 from .gui_plan import file_stamp, is_existing_subtitle_skip, make_provenance, path_key, validate_srt, Provenance
 from .gui_protocol import (JSONLDecoder, ProtocolError, ReconciliationRequired,
                            TERMINAL, VERSION, check_version, uuid_text, validate_event)
@@ -120,7 +121,7 @@ def _native_warnings(metadata, status):
 
 
 class RunStore:
-    def __init__(self, run_dir, run_id, plan, stream, *, asr_metadata=None):
+    def __init__(self, run_dir, run_id, plan, stream, *, asr_metadata=None, ownership_check=None):
         self.run_dir = Path(run_dir).resolve()
         if self.run_dir.is_relative_to(plan.root.resolve()):
             raise ValueError("run records must be outside audio library")
@@ -137,6 +138,7 @@ class RunStore:
         self.controls = {}
         self.reused_tracks = set()
         self.normalizations = {}
+        self.intermediate_cleanup = IntermediateCleanup(plan, ownership_check)
         self.run_dir.mkdir(parents=True, exist_ok=True)
         if any(p.name not in {"plan.json"} for p in self.run_dir.iterdir()):
             raise FileExistsError("run store is not new")
@@ -454,6 +456,13 @@ class RunStore:
                       "outcome": outcome, "counts": counts, "exit_code": code, "complete": True,
                       "tracks": {k: {key: value[key] for key in ("status", "receipt_ref", "receipt_hash", "revision")}
                                  for k, value in self.state["tracks"].items()}}
+            # All terminal receipts (including normalization evidence) are durable
+            # and verified; run_plan has joined every dependent reader.
+            cleanup = self.intermediate_cleanup.run(results, interrupted=bool(
+                counts["cancelled"] or counts["not_started"] or self.state.get("cancel_requested")))
+            result["intermediate_cleanup"] = cleanup
+            result["warnings"] = [CLEANUP_WARNING] if any(
+                r["status"] not in {"completed", "disabled"} for r in cleanup.values()) else []
             atomic_json(self.run_dir / "result.json", result)
             self.state["status"] = outcome
             self.emit("run_finished", status=outcome, payload={"outcome": outcome, "counts": counts,
@@ -667,6 +676,12 @@ def reconcile_run(run_dir, run_id, plan_hash, exit_code=None, *, verify_journal=
         if terminal_notice and (terminal_notice["payload"].get("result_ref") != "result.json" or
                                 terminal_notice["payload"].get("result_hash") != _digest(result)):
             raise ProtocolError("published result hash mismatch")
+    if result is not None and "intermediate_cleanup" in result:
+        cleanup = result["intermediate_cleanup"]
+        if (not isinstance(cleanup, dict) or any(k not in recovered for k in cleanup)
+                or result.get("warnings") not in ([], [CLEANUP_WARNING])):
+            raise ProtocolError("invalid intermediate cleanup result")
+        warnings.extend(result["warnings"])
     complete = result is not None and not failure_result
     outcome = result["outcome"] if result is not None else "interrupted"
     if exit_code is not None and (exit_code != 0 and outcome == "completed" or exit_code == 0 and result is None):

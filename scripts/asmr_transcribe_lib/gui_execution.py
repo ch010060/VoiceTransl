@@ -73,7 +73,8 @@ def run_plan(plan: ExecutionPlan, *, project_root: Path | str,
              opencc_converter: Callable, parallel: int | None = None,
              observer: Callable[[PipelineEvent], None] | None = None,
              cancel_token: CancellationToken | None = None,
-             normalization_store: Callable | None = None) -> list[TrackOutcome]:
+             normalization_store: Callable | None = None,
+             intermediate_store: Callable | None = None) -> list[TrackOutcome]:
     """Execute a checked plan through the existing scheduler (no new scheduler).
 
     Ordinary failures are isolated only here. Legacy run_tasks callers retain
@@ -155,6 +156,8 @@ def run_plan(plan: ExecutionPlan, *, project_root: Path | str,
                 ("opencc", task.opencc_srt_path)]}.get(path_key(path))
             if kind:
                 receipts.append(make_provenance(plan, track.track_id, path, kind))
+                if intermediate_store is not None:
+                    intermediate_store(track.track_id, path)
 
         def check_normalized_outputs():
             if timestamp_warnings:

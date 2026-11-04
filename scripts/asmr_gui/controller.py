@@ -137,6 +137,8 @@ class Controller(QObject):
             return False
         if limit is not None and (type(limit) is not int or limit < 1):
             return False
+        if type(settings.get("keep_intermediate_files", False)) is not bool:
+            return False
         # JSON copy prevents a settings dialog draft retaining mutable ownership.
         copied = json.loads(json.dumps(settings, ensure_ascii=False))
         self.settings, self.mode, self.limit = copied, mode, limit
@@ -699,6 +701,9 @@ class Controller(QObject):
             # Drain queued notifications before applying the authoritative result.
             self._drain_events()
             self.run_model.apply_reconciliation(result)
+            for warning in result.get("warnings", []):
+                if warning == "INTERMEDIATE_CLEANUP_INCOMPLETE":
+                    self.log_message.emit("警告：部分中間字幕未清理；請查看 result.json 的 intermediate_cleanup。")
             self.last_cleanup, self.last_run_dir = cleanup, directory
             self._save_historical_pointer(result, directory)
             self.log_message.emit("cleanup · verified=" + str(cleanup.get("cleanup_verified")) + " active=" + str(cleanup.get("active_count")))

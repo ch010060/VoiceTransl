@@ -119,9 +119,13 @@ def _helper_ready(stream, run_id):
 
 
 def _run(plan, args, run_dir, stream, adapters, failure_context):
-    verify_worker_ownership(args.state_root or default_state_root(), args.run_id, args.job_name, plan)
+    ownership_resources = verify_worker_ownership(
+        args.state_root or default_state_root(), args.run_id, args.job_name, plan)
     native_metadata = {}
-    store = RunStore(run_dir, args.run_id, plan, stream, asr_metadata=native_metadata)
+    store = RunStore(run_dir, args.run_id, plan, stream, asr_metadata=native_metadata,
+                     ownership_check=lambda: verify_worker_ownership(
+                         args.state_root or default_state_root(), args.run_id, args.job_name, plan,
+                         resources=ownership_resources))
     failure_context["store"] = store
     store.emit("worker_ready", status="ready", payload={"protocol": "1.0", "containment_ready": True})
     check = adapters.get("preflight", preflight) if adapters is not None else preflight
@@ -191,7 +195,8 @@ def _run(plan, args, run_dir, stream, adapters, failure_context):
     try:
         selected = _adapters(plan, native_metadata) if adapters is None else {key: value for key, value in adapters.items() if key != "preflight"}
         results = run_plan(plan, project_root=Path(args.project_root), observer=store.observer,
-                           cancel_token=token, normalization_store=store.record_normalization, **selected)
+                           cancel_token=token, normalization_store=store.record_normalization,
+                           intermediate_store=store.intermediate_cleanup.capture, **selected)
     finally:
         done.set()
         for thread in threads:

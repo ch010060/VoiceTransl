@@ -100,7 +100,7 @@ def _resource(identity: str):
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
-def verify_worker_ownership(state_root, run_id, job_name, plan):
+def verify_worker_ownership(state_root, run_id, job_name, plan, *, resources=None):
     """Read-only check of every controller-published output binding.
 
     This checks durable identity, not another process's file handle. The
@@ -108,7 +108,9 @@ def verify_worker_ownership(state_root, run_id, job_name, plan):
     lifetime handle throughout inference. A worker never acquires fresh leases.
     """
     expected = NamespaceLease(state_root, run_id, job_name, plan)
-    for resource, exclusive in expected.resources:
+    # A running worker rechecks the exact resources leased before inference;
+    # newly created output inodes were not present when the lease was acquired.
+    for resource, exclusive in expected.resources if resources is None else resources:
         marker = expected.state_root / "ownership" / resource / (expected.run_id + ".json")
         try:
             if marker.is_symlink():
@@ -122,6 +124,7 @@ def verify_worker_ownership(state_root, run_id, job_name, plan):
                   "state": "unsettled"}
         if actual != wanted:
             raise OwnershipConflict(resource)
+    return expected.resources if resources is None else resources
 
 
 class NamespaceLease:
