@@ -231,7 +231,7 @@ def _output_paths(task: AudioTask) -> tuple[tuple[str, Path], ...]:
 
 
 def _shared_output_owners(tracks, groups):
-    """Only non-representative duplicate copies with identical stage namespaces.
+    """Only non-representative copies with identical stage namespaces/actions.
 
     Representative aliases already use the established read-only copy path.
     This adds a single copy owner for another physical namespace in that group.
@@ -247,7 +247,8 @@ def _shared_output_owners(tracks, groups):
             classes.setdefault(signature, []).append(track)
         for members in classes.values():
             if (len(members) < 2 or any(t.track_id == group.representative_track_id for t in members)
-                    or any(t.task.action != "copy_duplicate_audio_subtitle" for t in members)):
+                    or {t.task.action for t in members} not in (
+                        {"copy_duplicate_audio_subtitle"}, {"copy_existing_subtitle"})):
                 continue
             chosen = _choose_representative_audio([t.task for t in members], members[0].task.work_dir)
             owner = next(t.track_id for t in members if t.task.audio_path == chosen.audio_path)
@@ -506,6 +507,11 @@ def build_execution_plan(root: Path | str, *, mode: str = "full",
             if task.action in {"copy_existing_subtitle", "copy_duplicate_audio_subtitle"}:
                 target = task.transcribe_srt_path if mode == "transcribe_only" else task.final_srt_path
                 kind = "transcription" if mode == "transcribe_only" else "final"
+                if (not track.shared_output_owner and not target.exists()
+                        and (not source or path_key(source) != path_key(target))):
+                    tmp = target.with_name(target.name + ".tmp")
+                    if tmp.exists():
+                        issues.append(PlanIssue("UNVERIFIED_LEGACY", (track.track_id,), (tmp,), "uncommitted temporary output"))
                 verified_owner = (track.shared_output_owner and
                                   _verified(by_id[track.shared_output_owner], target, kind, settings_hash, proof))
                 if target.exists() and not (_verified(track, target, kind, settings_hash, proof) or verified_owner):
