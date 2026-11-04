@@ -1,6 +1,7 @@
 """Dedicated native ASMR workstation; the controller owns every execution action."""
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import re
 from urllib.parse import urlsplit, urlunsplit
@@ -109,6 +110,13 @@ class BatchWindow(QMainWindow):
         super().__init__(parent)
         self.controller = controller
         self.preferences = QSettings("VoiceTransl", "ASMRBatchGUI")
+        if not controller.settings and controller.safe_to_edit:
+            try:
+                saved = json.loads(self.preferences.value("batch/settings", "{}"))
+                if isinstance(saved, dict) and saved:
+                    controller.apply_settings(saved, mode=controller.mode, limit=controller.limit)
+            except (TypeError, ValueError):
+                pass
         self._close_authorized = False
         self._toolbar_rows = 0
         self._startup_root = str(controller.root or self.preferences.value("last_input_root", "") or "")
@@ -429,7 +437,8 @@ class BatchWindow(QMainWindow):
         dialog = SettingsDialog(self.controller.settings, self.controller.mode, self.controller.limit, self)
         if dialog.exec() == QDialog.DialogCode.Accepted and self.controller.safe_to_edit:
             values, mode, limit = dialog.values()
-            self.controller.apply_settings(values, mode=mode, limit=limit)
+            if self.controller.apply_settings(values, mode=mode, limit=limit):
+                self.preferences.setValue("batch/settings", json.dumps(values, ensure_ascii=False))
 
     def _settings_changed(self):
         self._footer_settings = default_settings()

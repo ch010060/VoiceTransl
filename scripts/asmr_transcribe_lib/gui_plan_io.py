@@ -79,6 +79,8 @@ def _validate(plan):
         raise PlanTransportError("frozen identity or configuration mismatch")
     if plan.settings.get("path") != str(plan.root) or plan.settings.get("transcribe_only") != (plan.mode == "transcribe_only"):
         raise PlanTransportError("frozen configuration does not match plan")
+    if type(plan.settings.get("keep_intermediate_files", False)) is not bool:
+        raise PlanTransportError("invalid frozen cleanup preference")
     subtitle_policy = plan.settings.get("gui_existing_subtitles")
     if subtitle_policy not in {None, "skip_common"}:
         raise PlanTransportError("unsupported frozen subtitle policy")

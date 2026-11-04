@@ -253,20 +253,26 @@ def test_v17_settings_draft_ok_cancel_reset(app):
     assert {key: defaults[key] for key in ("parallel", "transcribe_parallel", "transcribe_batch_size", "translate_chunk_size")} == {
         "parallel": 5, "transcribe_parallel": 1, "transcribe_batch_size": 12, "translate_chunk_size": 20}
     assert defaults["fast_transcribe"] is True
+    assert defaults["keep_intermediate_files"] is False
     original = dict(defaults, parallel=8)
     dialog = SettingsDialog(original, mode="transcribe_only", limit=2)
     dialog.fields["parallel"].setValue(3)
+    dialog.fields["keep_intermediate_files"].setChecked(True)
     assert dialog.values()[0]["parallel"] == 3
     dialog.reset_button.click()
     assert dialog.values()[0]["parallel"] == 5
+    assert dialog.values()[0]["keep_intermediate_files"] is False
     assert original["parallel"] == 8
     dialog.reject()
     assert original["parallel"] == 8
     accepted = SettingsDialog(original, mode="transcribe_only", limit=2)
     accepted.fields["parallel"].setValue(4)
+    accepted.fields["keep_intermediate_files"].setChecked(True)
     accepted.accept()
     values, mode, limit = accepted.values()
     assert values["parallel"] == 4 and mode == "transcribe_only" and limit == 2
+    assert values["keep_intermediate_files"] is True
+    assert original["keep_intermediate_files"] is False
     assert original["parallel"] == 8
 
 
@@ -933,3 +939,69 @@ def test_evidence_host_control_and_geometry_offscreen(app, tmp_path):
             process.stdout.close()
         if process.stderr:
             process.stderr.close()
+
+
+@pytest.mark.parametrize("saved", [{}, {"parallel": 3}, {"keep_intermediate_files": True},
+                                   {"keep_intermediate_files": "false"}])
+def test_cleanup_saved_settings_compatibility(app, tmp_path, catalog, saved):
+    from scripts.asmr_gui.window import QSettings
+    from scripts.asmr_gui.settings import default_settings
+    preferences = QSettings("VoiceTransl", "ASMRBatchGUI")
+    preferences.setValue("batch/settings", json.dumps(saved))
+    controller, window = window_for(tmp_path, catalog)
+    try:
+        effective = {**default_settings(), **controller.settings}
+        assert effective["keep_intermediate_files"] is (saved.get("keep_intermediate_files") is True)
+        assert type(effective["keep_intermediate_files"]) is bool
+        if saved.get("parallel"):
+            assert effective["parallel"] == 3
+    finally:
+        window._close_authorized = True
+        window.close()
+        controller.request_close()
+
+
+@pytest.mark.parametrize("accept", [False, True])
+def test_cleanup_settings_ok_persists_cancel_discards(app, tmp_path, catalog, monkeypatch, accept):
+    from PyQt6.QtWidgets import QDialog
+    from scripts.asmr_gui.settings import SettingsDialog
+    controller, window = window_for(tmp_path, catalog)
+    def execute(dialog):
+        dialog.fields["keep_intermediate_files"].setChecked(True)
+        return QDialog.DialogCode.Accepted if accept else QDialog.DialogCode.Rejected
+    monkeypatch.setattr(SettingsDialog, "exec", execute)
+    try:
+        window._settings()
+        assert controller.settings.get("keep_intermediate_files", False) is accept
+        stored = json.loads(window.preferences.value("batch/settings", "{}"))
+        assert stored.get("keep_intermediate_files", False) is accept
+        if accept:
+            assert controller.apply_settings({"keep_intermediate_files": "false"}) is False
+            assert controller.settings["keep_intermediate_files"] is True
+    finally:
+        window._close_authorized = True
+        window.close()
+        controller.request_close()
+
+
+def test_cleanup_dialog_rejects_malformed_setting(app):
+    from scripts.asmr_gui.settings import SettingsDialog
+    with pytest.raises(ValueError, match="boolean"):
+        SettingsDialog({"keep_intermediate_files": "false"})
+
+
+def test_cleanup_preferences_preserve_existing_mode_and_limit(app, tmp_path, catalog):
+    from scripts.asmr_gui.controller import Controller
+    from scripts.asmr_gui.window import BatchWindow, QSettings
+    QSettings("VoiceTransl", "ASMRBatchGUI").setValue(
+        "batch/settings", json.dumps({"keep_intermediate_files": True}))
+    controller = Controller(state_root=tmp_path / "state", project_root=PROJECT)
+    controller.mode, controller.limit = "transcribe_only", 2
+    window = BatchWindow(controller)
+    try:
+        assert controller.mode == "transcribe_only" and controller.limit == 2
+        assert controller.settings["keep_intermediate_files"] is True
+    finally:
+        window._close_authorized = True
+        window.close()
+        controller.request_close()

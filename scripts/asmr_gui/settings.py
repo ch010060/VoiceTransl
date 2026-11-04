@@ -12,7 +12,8 @@ _EXCLUDED = {"path", "execute", "dry_run", "limit", "transcribe_only"}
 def default_settings(root=".") -> dict:
     from scripts.asmr_transcribe_lib.cli import build_parser
     values = vars(build_parser().parse_args(["--path", str(root)]))
-    return {key: value for key, value in values.items() if key not in _EXCLUDED}
+    return {**{key: value for key, value in values.items() if key not in _EXCLUDED},
+            "keep_intermediate_files": False}
 
 
 class SettingsDialog(QDialog):
@@ -72,6 +73,11 @@ class SettingsDialog(QDialog):
         hint.setWordWrap(True)
         hint.setObjectName("muted")
         translation.addRow(hint)
+        advanced = self._tab(tabs, "進階設定")
+        self._check(advanced, "keep_intermediate_files", "保留處理過程中的字幕檔案")
+        description = QLabel("預設成功後清理轉錄、翻譯及 OpenCC 中間字幕；開啟後保留以供除錯。失敗或中斷時不自動刪除。")
+        description.setWordWrap(True)
+        advanced.addRow(description)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         self.reset_button = QPushButton("重設草稿")
         buttons.addButton(self.reset_button, QDialogButtonBox.ButtonRole.ResetRole)
@@ -81,6 +87,8 @@ class SettingsDialog(QDialog):
         layout.addWidget(buttons)
         draft = default_settings()
         draft.update({key: value for key, value in settings.items() if key in draft})
+        if type(draft["keep_intermediate_files"]) is not bool:
+            raise ValueError("keep_intermediate_files must be boolean")
         self._load(draft, mode, limit)
 
     def _tab(self, tabs, title):
