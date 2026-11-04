@@ -205,6 +205,7 @@ class RunLogFormatter:
                 "event": {"failed": "track_failed", "cancelled": "track_cancelled", "not_started": "track_not_started"}.get(status, "track_finished"),
                 "stage": error.get("stage"), "status": status, "elapsed_ms": stored.get("ended_ms") or 0, "recovered": True,
                 "payload": {"receipt_id": stored["receipt_ref"], "reason": stored.get("reason"),
+                            "warnings": stored.get("warnings", []),
                             "error": {"code": code, "detail_ref": error.get("diagnostic_ref", stored["receipt_ref"])}}}))
         outcome = result.get("outcome", "interrupted")
         reason = ("使用者要求停止" if user_stop or outcome == "cancelled" else

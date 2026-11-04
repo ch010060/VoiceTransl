@@ -3,6 +3,8 @@ import io
 import json
 import os
 import subprocess
+from pathlib import Path
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -12,7 +14,7 @@ from scripts.asmr_transcribe_lib.gui_execution import run_plan
 from scripts.asmr_transcribe_lib.gui_plan import build_execution_plan, validate_srt
 from scripts.asmr_transcribe_lib.gui_results import RunStore, read_json, reconcile_run, safe_ref
 from scripts.asmr_transcribe_lib.gui_protocol import ProtocolError
-from scripts.asmr_transcribe_lib.runtime import CancellationToken
+from scripts.asmr_transcribe_lib.runtime import CancellationToken, ObserverError
 from test_asmr_gui_srt_normalization import RAW
 
 SRT = b"1\n00:00:00,000 --> 00:00:01,000\nsynthetic subtitle\n\n"
@@ -37,6 +39,19 @@ def prepare(tmp_path, *, keep=False, mode="full", names=("voice.wav",), existing
 
 
 def execute(plan, store, *, fail=None, normalized=False, token=None, before_finish=None):
+    if before_finish:
+        cleanup = store.cleanup_work
+        called = []
+        def before_cleanup(work_id):
+            if not called and all(t["status"] in {"success", "failed", "copied", "skipped", "transcribed", "cancelled", "not_started"}
+                                  for t in store.state["tracks"].values()):
+                called.append(work_id)
+                outcomes = [SimpleNamespace(track_id=key, status=t["status"],
+                            output_path=Path(store.identities[key]["output_key"])) for key, t in store.state["tracks"].items()]
+                before_finish(outcomes)
+                store._save_state()
+            return cleanup(work_id)
+        store.cleanup_work = before_cleanup
     def asr(*, transcribe_srt_path, **kwargs):
         transcribe_srt_path.write_bytes(RAW if normalized else SRT)
         if fail == "asr":
@@ -56,8 +71,6 @@ def execute(plan, store, *, fail=None, normalized=False, token=None, before_fini
                        observer=store.observer, cancel_token=token,
                        normalization_store=store.record_normalization,
                        intermediate_store=store.intermediate_cleanup.capture)
-    if before_finish:
-        before_finish(results)
     return results, store.finish(results)
 
 
@@ -210,21 +223,23 @@ def test_parent_substitution_is_rejected(tmp_path):
         else:
             parent.symlink_to(moved, target_is_directory=True)
     # The earlier receipt barrier itself rejects changed source identity.
-    with pytest.raises(ProtocolError):
+    with pytest.raises(ObserverError) as caught:
         execute(plan, store, before_finish=replace_parent)
+    assert isinstance(caught.value.__cause__, ProtocolError)
     assert all(p.exists() for p in intermediates(plan.tracks[0]))
 
 
 def test_locked_file_keeps_success_and_warning(tmp_path, monkeypatch):
+    import scripts.asmr_transcribe_lib.gui_cleanup as module
     plan, store = prepare(tmp_path)
     locked = intermediates(plan.tracks[0])[1]
-    original = os.unlink
+    original = module._remove_owned
     def unlink(path, *args, **kwargs):
-        if str(path) in {locked.name, str(locked)}:
+        if path == locked:
             raise PermissionError("private synthetic path must not appear in result")
         return original(path, *args, **kwargs)
     def lock(results):
-        monkeypatch.setattr(os, "unlink", unlink)
+        monkeypatch.setattr(module, "_remove_owned", unlink)
     results, result = execute(plan, store, before_finish=lock)
     assert results[0].status == "success" and result["outcome"] == "completed"
     assert locked.exists()
@@ -263,13 +278,13 @@ def test_dependency_read_is_retained(tmp_path):
     from scripts.asmr_transcribe_lib.gui_plan import OutputUse
     owner = next(t for t in plan.tracks if t.task.action == "process")
     reader = next(t for t in plan.tracks if t.track_id != owner.track_id)
-    # Exercise a future scheduler's intermediate read without changing scheduling.
+    # An intermediate reader is protected until its authoritative receipt settles.
     plan.__dict__["output_ownership"] = (*plan.output_ownership, *[
         OutputUse(path, role, reader.track_id, owner.track_id, "read")
         for role, path in zip(ROLES, intermediates(owner))])
     _, result = execute(plan, store)
-    assert all(p.exists() for p in intermediates(owner))
-    assert result["intermediate_cleanup"][owner.track_id]["status"] == "deferred_dependencies"
+    assert all(not p.exists() for p in intermediates(owner))
+    assert result["intermediate_cleanup"][owner.track_id]["status"] == "completed"
 
 
 def test_frozen_setting_and_malformed_values(tmp_path):
@@ -287,8 +302,9 @@ def test_cleanup_does_not_run_before_all_receipts_verified(tmp_path):
     def corrupt_receipt(results):
         path = store.run_dir / "receipts" / (results[0].track_id + ".json")
         path.write_text("{}")
-    with pytest.raises(ProtocolError):
+    with pytest.raises(ObserverError) as caught:
         execute(plan, store, before_finish=corrupt_receipt)
+    assert isinstance(caught.value.__cause__, ProtocolError)
     assert all(p.exists() for p in intermediates(plan.tracks[0]))
 
 

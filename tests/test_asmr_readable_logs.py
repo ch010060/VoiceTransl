@@ -195,3 +195,17 @@ def test_repaired_timestamp_success_has_truthful_readable_warning(tmp_path):
     text = (store.run_dir / "logs/execution.log").read_text(encoding="utf-8")
     assert WARNING_CODE in text and "完成翻譯" in text and "DEFERRED" not in text
     assert "Synthetic" not in text
+
+
+def test_reconciled_receipt_retains_normalization_warning(view, tmp_path):
+    from test_asmr_gui_srt_normalization import RAW
+    controller, _ = view
+    plan = build_execution_plan(library(tmp_path, variants=False))
+    def asr(*, transcribe_srt_path, **kwargs):
+        transcribe_srt_path.write_bytes(RAW)
+        return transcribe_srt_path
+    store, _, _ = execute(plan, tmp_path / "run", asr=asr)
+    recovered = controller._enrich(reconcile_run(store.run_dir, store.run_id, plan.plan_hash), store.run_dir)
+    formatter = RunLogFormatter(plan, store.run_id)
+    lines = formatter.reconcile(recovered, {"cleanup_verified": True, "active_count": 0})
+    assert "SRT_TIMESTAMP_NORMALIZED" in str(lines) and "DEFERRED" not in str(lines)

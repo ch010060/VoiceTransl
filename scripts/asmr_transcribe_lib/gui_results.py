@@ -12,7 +12,7 @@ import threading
 import time
 from uuid import uuid4
 
-from .gui_cleanup import IntermediateCleanup, WARNING as CLEANUP_WARNING
+from .gui_cleanup import IntermediateCleanup, ROLES, WARNING as CLEANUP_WARNING
 from .gui_plan import file_stamp, is_existing_subtitle_skip, make_provenance, path_key, validate_srt, Provenance
 from .gui_protocol import (JSONLDecoder, ProtocolError, ReconciliationRequired,
                            TERMINAL, VERSION, check_version, uuid_text, validate_event)
@@ -120,6 +120,95 @@ def _native_warnings(metadata, status):
     return [warning] if warning else []
 
 
+def _cleanup_checkpoint(run_dir, manifest, state):
+    path = safe_ref(run_dir, "intermediate_cleanup.json")
+    if not path.exists():
+        return {"schema_version": VERSION, "run_id": manifest["run_id"],
+                "plan_hash": manifest["plan_hash"], "works": {}}
+    record = read_json(path)
+    _validate_identity(record, manifest["run_id"], manifest["plan_hash"])
+    if not isinstance(record.get("works"), dict):
+        raise ProtocolError("invalid work cleanup checkpoint")
+    statuses = {"in_progress", "completed", "partial_failed", "deferred_dependencies", "deferred_interrupted"}
+    files = {"pending_delete", "removed", "absent_after_intent", "failed_or_unsafe", "deferred_dependencies"}
+    for work_id, work in record["works"].items():
+        ids = {key for key, identity in manifest["tracks"].items() if identity["work_id"] == work_id}
+        if (not ids or not isinstance(work, dict) or work.get("status") not in statuses
+                or type(work.get("attempts")) is not int or not 0 <= work["attempts"] <= 3
+                or not isinstance(work.get("tracks"), dict) or set(work["tracks"]) - ids
+                or not isinstance(work.get("receipt_hashes"), dict)
+                or not isinstance(work.get("waiting_for"), list)
+                or any(key not in manifest["tracks"] for key in work["waiting_for"])
+                or not ids <= work["receipt_hashes"].keys()
+                or any(key not in state["tracks"] or state["tracks"][key].get("receipt_hash") != digest
+                       for key, digest in work["receipt_hashes"].items())):
+            raise ProtocolError("work cleanup receipt barrier mismatch")
+        for entry in work["tracks"].values():
+            if (not isinstance(entry, dict) or entry.get("status") not in
+                    {"disabled", "completed", "partial_failed", "deferred_dependencies", "deferred_interrupted"}
+                    or not isinstance(entry.get("files"), dict) or set(entry["files"]) - set(ROLES)
+                    or any(value not in files for value in entry["files"].values())):
+                raise ProtocolError("invalid intermediate cleanup state")
+    return record
+
+
+def cleanup_completed_work(run_dir, run_id, work_id, cleanup, *, retry=False):
+    """Caller retains the original namespace lease; never acquire recovery authority."""
+    plan = cleanup.plan
+    run_dir = Path(run_dir).resolve()
+    if run_dir.is_relative_to(plan.root):
+        raise ProtocolError("cleanup records must be outside library")
+    manifest, state = (read_json(safe_ref(run_dir, name)) for name in ("plan_identity.json", "state.json"))
+    for record in (manifest, state):
+        _validate_identity(record, run_id, plan.plan_hash)
+    if manifest.get("settings_hash") != plan.settings_hash or manifest.get("mode") != plan.mode:
+        raise ProtocolError("cleanup frozen settings mismatch")
+    ids = [t.track_id for t in plan.planned_tracks if t.work_id == work_id]
+    if not ids or any(state["tracks"][key].get("status") not in TERMINAL for key in ids):
+        return None
+    relevant = set(ids)
+    paths = {p for key in ids for p in (plan.track_index[key].task.transcribe_srt_path,
+                                       plan.track_index[key].task.translate_srt_path, plan.track_index[key].task.opencc_srt_path)}
+    relevant.update(use.track_id for use in plan.output_ownership if use.path in paths and use.access == "read")
+    relevant.update(t.track_id for t in plan.planned_tracks if set(t.dependencies) & set(ids))
+    receipts = {}
+    for key in relevant:
+        stored = state["tracks"].get(key, {})
+        if stored.get("status") in TERMINAL and stored.get("receipt_ref"):
+            if manifest["tracks"].get(key) != _identity(plan.track_index[key], plan.mode, plan.settings_hash):
+                raise ProtocolError("cleanup identity differs from frozen plan")
+            receipts[key] = _verify_receipt(run_dir, manifest, key, stored)
+    if not set(ids) <= receipts.keys():
+        raise ProtocolError("cleanup lacks authoritative terminal receipts")
+    try:
+        checkpoint = _cleanup_checkpoint(run_dir, manifest, state)
+    except OSError:
+        return {"status": "persistence_failed", "tracks": {}}
+    previous = checkpoint["works"].get(work_id)
+    if previous and (previous["status"] == "completed" or previous["attempts"] >= 3
+                     or not retry and previous["status"] != "deferred_dependencies"):
+        return previous
+    waiting = relevant - receipts.keys()
+    entry = {"status": "in_progress", "attempts": (previous or {}).get("attempts", 0) + (not waiting),
+             "receipt_hashes": {key: state["tracks"][key]["receipt_hash"] for key in receipts},
+             "waiting_for": sorted(waiting), "tracks": (previous or {}).get("tracks", {})}
+    checkpoint["works"][work_id] = entry
+    def persist(records):
+        entry["tracks"] = records
+        atomic_json(safe_ref(run_dir, "intermediate_cleanup.json"), checkpoint)
+    try:
+        records = cleanup.run(ids, receipts, entry["tracks"], persist, interrupted=bool(
+            state.get("cancel_requested") or any(receipts[key]["status"] in {"cancelled", "not_started"} for key in ids)))
+        statuses = {record["status"] for record in records.values()}
+        entry["status"] = ("completed" if statuses <= {"completed", "disabled"} else
+                           "deferred_dependencies" if statuses == {"deferred_dependencies"} else
+                           "deferred_interrupted" if statuses == {"deferred_interrupted"} else "partial_failed")
+        persist(records)
+    except OSError:
+        entry["status"] = "persistence_failed"
+    return entry
+
+
 class RunStore:
     def __init__(self, run_dir, run_id, plan, stream, *, asr_metadata=None, ownership_check=None):
         self.run_dir = Path(run_dir).resolve()
@@ -139,6 +228,7 @@ class RunStore:
         self.reused_tracks = set()
         self.normalizations = {}
         self.intermediate_cleanup = IntermediateCleanup(plan, ownership_check)
+        self._work_cleanup, self._pending_cleanup = {}, {}
         self.run_dir.mkdir(parents=True, exist_ok=True)
         if any(p.name not in {"plan.json"} for p in self.run_dir.iterdir()):
             raise FileExistsError("run store is not new")
@@ -330,6 +420,8 @@ class RunStore:
         if normalization is not None:
             receipt["timestamp_normalization"] = normalization
             _verify_normalization(self.run_dir, receipt)
+        if event.status == "success" and track.task.action == "process" and not track.shared_output_owner:
+            receipt["intermediate_artifacts"] = self.intermediate_cleanup.evidence(track.track_id)
         if event.status == "failed" and str(event.reason).startswith("SRT_TIMESTAMP_ORDER_INVALID:"):
             receipt["error_code"] = "SRT_TIMESTAMP_ORDER_INVALID"
             receipt["timestamp_error"] = event.reason.split(":", 1)[1]
@@ -393,6 +485,24 @@ class RunStore:
                     if name == "track_cancelled":
                         payload["checkpoint_refs"] = []
             self.emit(name, track_id=track.track_id, stage=stage, status=status, payload=payload)
+            if status in TERMINAL:
+                ready = {track.work_id} | {key for key, waiting in self._pending_cleanup.items() if track.track_id in waiting}
+                for work_id in ready:
+                    self.cleanup_work(work_id)
+
+    def cleanup_work(self, work_id):
+        with self.lock:
+            ids = [t.track_id for t in self.plan.planned_tracks if t.work_id == work_id]
+            if any(self.state["tracks"][key]["status"] not in TERMINAL for key in ids):
+                return
+            entry = cleanup_completed_work(self.run_dir, self.run_id, work_id, self.intermediate_cleanup)
+            if entry is not None:
+                self._work_cleanup[work_id] = entry
+                if entry.get("waiting_for"):
+                    self._pending_cleanup[work_id] = set(entry["waiting_for"])
+                else:
+                    self._pending_cleanup.pop(work_id, None)
+            return entry
 
     def snapshot(self) -> dict:
         with self.lock:
@@ -456,13 +566,12 @@ class RunStore:
                       "outcome": outcome, "counts": counts, "exit_code": code, "complete": True,
                       "tracks": {k: {key: value[key] for key in ("status", "receipt_ref", "receipt_hash", "revision")}
                                  for k, value in self.state["tracks"].items()}}
-            # All terminal receipts (including normalization evidence) are durable
-            # and verified; run_plan has joined every dependent reader.
-            cleanup = self.intermediate_cleanup.run(results, interrupted=bool(
-                counts["cancelled"] or counts["not_started"] or self.state.get("cancel_requested")))
+            for work_id in {t.work_id for t in self.plan.planned_tracks} - self._work_cleanup.keys():
+                self.cleanup_work(work_id)
+            cleanup = {key: record for work in self._work_cleanup.values() for key, record in work["tracks"].items()}
             result["intermediate_cleanup"] = cleanup
             result["warnings"] = [CLEANUP_WARNING] if any(
-                r["status"] not in {"completed", "disabled"} for r in cleanup.values()) else []
+                work["status"] != "completed" for work in self._work_cleanup.values()) else []
             atomic_json(self.run_dir / "result.json", result)
             self.state["status"] = outcome
             self.emit("run_finished", status=outcome, payload={"outcome": outcome, "counts": counts,
@@ -529,6 +638,16 @@ def _verify_receipt(run_dir, manifest, track_id, stored):
     if receipt.get("status") != stored.get("status") or receipt.get("revision") != stored.get("revision") or receipt.get("status") not in TERMINAL:
         raise ProtocolError("receipt revision or outcome mismatch")
     status = receipt["status"]
+    artifacts = receipt.get("intermediate_artifacts")
+    if artifacts is not None:
+        if (status != "success" or not isinstance(artifacts, dict) or set(artifacts) - set(ROLES)
+                or any(not isinstance(value, dict) or set(value) != {"stamp", "directories"}
+                       or not isinstance(value["stamp"], list) or len(value["stamp"]) != 6
+                       or not isinstance(value["directories"], list) or not value["directories"]
+                       or any(not isinstance(d, list) or len(d) != 3 or not isinstance(d[0], str)
+                              or any(type(n) is not int for n in d[1:]) for d in value["directories"])
+                       for value in artifacts.values())):
+            raise ProtocolError("invalid intermediate artifact evidence")
     error = receipt.get("error")
     if error is not None:
         if (not isinstance(error, dict) or error.get("work_id") != expected["work_id"]
@@ -615,6 +734,14 @@ def reconcile_run(run_dir, run_id, plan_hash, exit_code=None, *, verify_journal=
             raise ProtocolError("terminal snapshot lacks authoritative receipt")
     counts = _summary(recovered)
     warnings = []
+    intermediate_cleanup = {}
+    try:
+        checkpoint = _cleanup_checkpoint(run_dir, manifest, {**state, "tracks": {**state["tracks"], **recovered}})
+        intermediate_cleanup = {key: value for work in checkpoint["works"].values() for key, value in work["tracks"].items()}
+        if any(work["status"] != "completed" for work in checkpoint["works"].values()):
+            warnings.append(CLEANUP_WARNING)
+    except OSError:
+        warnings.append(CLEANUP_WARNING)
     decoder = JSONLDecoder(run_id)
     terminal_notice = None
     journal_events = []
@@ -682,6 +809,8 @@ def reconcile_run(run_dir, run_id, plan_hash, exit_code=None, *, verify_journal=
                 or result.get("warnings") not in ([], [CLEANUP_WARNING])):
             raise ProtocolError("invalid intermediate cleanup result")
         warnings.extend(result["warnings"])
+        if not intermediate_cleanup:
+            intermediate_cleanup = result["intermediate_cleanup"]
     complete = result is not None and not failure_result
     outcome = result["outcome"] if result is not None else "interrupted"
     if exit_code is not None and (exit_code != 0 and outcome == "completed" or exit_code == 0 and result is None):
@@ -690,7 +819,8 @@ def reconcile_run(run_dir, run_id, plan_hash, exit_code=None, *, verify_journal=
     return {"schema_version": VERSION, "run_id": run_id, "plan_hash": plan_hash,
             "outcome": outcome, "complete": complete, "counts": counts,
             "tracks": recovered, "missing_track_ids": sorted(set(manifest["tracks"]) - set(recovered)),
-            "warnings": warnings, "exit_code": exit_code if exit_code is not None else (result or {}).get("exit_code")}
+            "warnings": list(dict.fromkeys(warnings)), "intermediate_cleanup": intermediate_cleanup,
+            "exit_code": exit_code if exit_code is not None else (result or {}).get("exit_code")}
 
 
 def resume_provenance(run_dir, run_id, plan_hash) -> tuple[Provenance, ...]:

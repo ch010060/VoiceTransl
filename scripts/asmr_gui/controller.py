@@ -569,6 +569,7 @@ class Controller(QObject):
                 receipt = read_json(safe_ref(run_dir, ref))
                 track["warnings"] = receipt.get("warnings", [])
                 track["error"] = receipt.get("error")
+                track["warnings"] = receipt.get("warnings", [])
                 track["reason"] = (receipt.get("error_code") if receipt.get("status") == "failed" else receipt.get("reason")) or track.get("reason")
         return result
 
