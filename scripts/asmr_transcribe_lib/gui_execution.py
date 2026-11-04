@@ -240,28 +240,17 @@ def run_plan(plan: ExecutionPlan, *, project_root: Path | str,
 
     for track in plan.planned_tracks:
         emit(PipelineEvent("track_queued", track.track_id, status="queued"))
-    # Stable dependency order within the existing scheduler's deferred-copy
-    # queue. Keep ordinals/IDs/result ordering from the frozen plan unchanged.
-    ordered, visited = [], set()
     planned_ids = {t.track_id for t in plan.planned_tracks}
-    def visit(track):
-        if track.track_id in visited:
-            return
-        visited.add(track.track_id)
-        for dependency in track.dependencies:
-            if dependency not in planned_ids:
-                raise ValueError("dependency is outside planned execution")
-            visit(plan.track_index[dependency])
-        ordered.append(track.task)
-    for track in plan.planned_tracks:
-        visit(track)
+    if any(dep not in planned_ids for t in plan.planned_tracks for dep in t.dependencies):
+        raise ValueError("dependency is outside planned execution")
     results = run_tasks(
-        ordered, project_root=project_root,
+        [t.task for t in plan.planned_tracks], project_root=project_root,
         faster_whisper_config=_config(plan, Path(project_root)), translator=translator,
         transcriber=transcriber, opencc_converter=opencc_converter,
         parallel=settings["parallel"], transcribe_parallel=settings["transcribe_parallel"],
         task_processor=process,
-        defer_task=lambda task: bool(planned[task.audio_path].dependencies),
+        task_dependencies={t.task.audio_path: tuple(plan.track_index[dep].task.audio_path for dep in t.dependencies)
+                           for t in plan.planned_tracks},
     )
     by_audio = {r.audio_path: r for r in results}
     return [by_audio[t.task.audio_path] for t in plan.planned_tracks]

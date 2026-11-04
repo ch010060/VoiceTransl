@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from collections.abc import Callable
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 import shutil
@@ -166,12 +167,22 @@ def run_tasks(
     progress_tick_callback: ProgressTickCallback | None = None,
     task_processor: Callable[..., TaskResult] | None = None,
     defer_task: Callable[[AudioTask], bool] | None = None,
+    task_dependencies: dict[Path, tuple[Path, ...]] | None = None,
 ) -> list[TaskResult]:
     if parallel < 1:
         raise ValueError("parallel must be >= 1")
     if transcribe_parallel < 1:
         raise ValueError("transcribe_parallel must be >= 1")
     transcribe_semaphore = threading.Semaphore(transcribe_parallel)
+    if task_dependencies is not None:
+        if task_processor is None or limit is not None:
+            raise ValueError("dependency execution requires a frozen processor and selection")
+        return _run_dependency_ready(tasks, task_dependencies, parallel, progress_tick_callback,
+            lambda index: _process_with_transcribe_gate(
+                index, tasks[index], progress_callback, project_root=project_root,
+                faster_whisper_config=faster_whisper_config, transcriber=transcriber,
+                transcribe_semaphore=transcribe_semaphore, translator=translator,
+                opencc_converter=opencc_converter, task_processor=task_processor))
     if parallel == 1:
         return _run_tasks_sequential(
             tasks,
@@ -270,6 +281,57 @@ def run_tasks(
             )
 
     return [result for _index, result in sorted(indexed_results, key=lambda item: item[0])]
+
+
+def _run_dependency_ready(tasks, dependencies, parallel, tick, process):
+    """GUI opt-in to the existing pipeline; at most parallel active Futures.
+
+    A Future completes only after its processor has validated/published its
+    receipt. Failed dependents still enter the processor to record not_started.
+    """
+    indexes = {task.audio_path: index for index, task in enumerate(tasks)}
+    if len(indexes) != len(tasks) or set(dependencies) != set(indexes):
+        raise ValueError("dependency inventory differs from planned execution")
+    remaining, dependents = {}, {index: [] for index in indexes.values()}
+    for path, required in dependencies.items():
+        if set(required) - indexes.keys():
+            raise ValueError("dependency is outside planned execution")
+        index = indexes[path]
+        remaining[index] = len(set(required))
+        for source in set(required):
+            dependents[indexes[source]].append(index)
+    ready = deque(index for index in range(len(tasks)) if not remaining[index])
+    # Validate the whole DAG before executing any task, without blocking workers.
+    check, counts, visited = deque(ready), dict(remaining), 0
+    while check:
+        current = check.popleft()
+        visited += 1
+        for child in dependents[current]:
+            counts[child] -= 1
+            if not counts[child]:
+                check.append(child)
+    if visited != len(tasks):
+        raise ValueError("cyclic task dependency")
+    results, active = {}, {}
+    with ThreadPoolExecutor(max_workers=parallel) as executor:
+        while ready or active:
+            while ready and len(active) < parallel:
+                index = ready.popleft()
+                active[executor.submit(process, index)] = index
+            done, _ = wait(active, timeout=1, return_when=FIRST_COMPLETED)
+            if not done and tick is not None:
+                tick()
+            for future in sorted(done, key=active.get):
+                index = active.pop(future)
+                results[index] = future.result()
+                released = []
+                for child in dependents[index]:
+                    remaining[child] -= 1
+                    if not remaining[child]:
+                        released.append(child)
+                # Ready copies take the freed slot before unrelated queued ASR.
+                ready.extendleft(reversed(released))
+    return [results[index] for index in range(len(tasks))]
 
 
 def _run_tasks_sequential(
