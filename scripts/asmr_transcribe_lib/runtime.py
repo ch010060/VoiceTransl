@@ -18,9 +18,18 @@ class ObserverError(RuntimeError):
 class CancellationToken:
     def __init__(self) -> None:
         self._event = threading.Event()
+        self._reason = "run_cancelled"
+        self._lock = threading.Lock()
 
-    def cancel(self) -> None:
-        self._event.set()
+    def cancel(self, reason="run_cancelled") -> None:
+        with self._lock:
+            if not self._event.is_set():
+                self._reason = reason
+                self._event.set()
+
+    @property
+    def reason(self):
+        return self._reason
 
     @property
     def cancelled(self) -> bool:
@@ -28,7 +37,7 @@ class CancellationToken:
 
     def checkpoint(self) -> None:
         if self.cancelled:
-            raise PipelineCancelled("run_cancelled")
+            raise PipelineCancelled(self._reason)
 
 
 @dataclass(frozen=True)
@@ -39,6 +48,7 @@ class PipelineEvent:
     status: str | None = None
     progress: tuple[float, float, float] | None = None
     reason: str | None = None
+    failure: dict | None = None
 
 
 @dataclass(frozen=True)

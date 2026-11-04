@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 import inspect
+import subprocess
 import os
 from pathlib import Path
 import shutil
@@ -14,6 +15,7 @@ from .gui_plan import (ExecutionPlan, Provenance, file_stamp, is_existing_subtit
 from .local_faster_whisper import FasterWhisperConfig, find_faster_whisper_model_dir, run_faster_whisper_transcription
 from .pipeline import TaskResult, process_audio_task, run_tasks
 from .runtime import CancellationToken, ObserverError, PipelineCancelled, PipelineEvent, TaskRuntime
+from .gui_errors import ExecutionFailure, failure_record, srt_failure
 
 
 @dataclass(frozen=True)
@@ -21,6 +23,7 @@ class TrackOutcome(TaskResult):
     track_id: str = ""
     warnings: tuple[str, ...] = ()
     provenance: tuple[Provenance, ...] = ()
+    failure: dict | None = None
 
 
 def _publish_new(source: Path, target: Path) -> None:
@@ -92,7 +95,7 @@ def run_plan(plan: ExecutionPlan, *, project_root: Path | str,
                 try:
                     observer(event)
                 except Exception as exc:
-                    token.cancel()
+                    token.cancel("run_aborted")
                     raise ObserverError("observer failed") from exc
 
     def process(*, index, task, progress_callback, project_root, faster_whisper_config,
@@ -105,7 +108,7 @@ def run_plan(plan: ExecutionPlan, *, project_root: Path | str,
 
         def unchanged(path):
             if file_stamp(path) != expected_inventory[path]:
-                raise ValueError("planned output changed before execution")
+                raise ExecutionFailure("OUTPUT_CHANGED")
 
         def stage_changed(name):
             nonlocal stage
@@ -115,18 +118,28 @@ def run_plan(plan: ExecutionPlan, *, project_root: Path | str,
                 for path in [task.transcribe_srt_path, task.translate_srt_path, task.opencc_srt_path]:
                     unchanged(path)
 
-        def finish(status, reason, output=None, warnings=()):
+        def finish(status, reason, output=None, warnings=(), failure=None):
+            if failure is None and status in {"not_started", "cancelled"}:
+                code = {"dependency_failed": "DEPENDENCY_FAILED", "source_changed": "SOURCE_CHANGED",
+                        "run_cancelled": "CANCELLATION_REQUESTED"}.get(reason, "RUN_ABORTED")
+                failure = failure_record(code, stage)
             result = TrackOutcome(status, reason, task.audio_path, output, track.track_id,
-                                  warnings, tuple(receipts))
+                                  warnings, tuple(receipts), failure)
             with lock:
                 outcomes[track.track_id] = result
             event = {"failed": "track_failed", "cancelled": "track_cancelled",
                      "not_started": "track_not_started"}.get(status, "track_finished")
-            emit(PipelineEvent(event, track.track_id, stage, status, reason=reason if status != "failed" else "track_exception"))
+            emit(PipelineEvent(event, track.track_id, stage, status, reason=reason, failure=failure))
             return result
 
+        def check_srt(path):
+            try:
+                validate_srt(path)
+            except Exception as exc:
+                raise srt_failure(exc, path) from exc
+
         def validate(path):
-            validate_srt(path)
+            check_srt(path)
             kind = {path_key(p): role for role, p in [
                 ("transcription", task.transcribe_srt_path), ("translation", task.translate_srt_path),
                 ("opencc", task.opencc_srt_path)]}.get(path_key(path))
@@ -141,7 +154,7 @@ def run_plan(plan: ExecutionPlan, *, project_root: Path | str,
                 stage_changed("asr")
                 token.checkpoint()
                 if file_stamp(task.audio_path) != track.source_stamp:
-                    raise ValueError("source changed while waiting for ASR")
+                    raise ExecutionFailure("SOURCE_CHANGED")
                 if task.transcribe_srt_path.exists():
                     raise ValueError("unexpected transcript appeared before ASR")
                 if progress_callback:
@@ -151,7 +164,15 @@ def run_plan(plan: ExecutionPlan, *, project_root: Path | str,
                 parameters = inspect.signature(transcriber).parameters
                 if "transcription_progress_callback" in parameters or any(p.kind == p.VAR_KEYWORD for p in parameters.values()):
                     kwargs["transcription_progress_callback"] = report
-                result = transcriber(**kwargs)
+                try:
+                    result = transcriber(**kwargs)
+                except (ObserverError, PipelineCancelled, ExecutionFailure):
+                    raise
+                except Exception as exc:
+                    code = "ASR_PROCESS_FAILED" if isinstance(exc, subprocess.CalledProcessError) or exc.args == ("ASR_NATIVE_EXIT_UNSUCCESSFUL",) else "ASR_EXECUTION_FAILED"
+                    raise ExecutionFailure(code, exc) from exc
+                if not Path(result).is_file():
+                    raise ExecutionFailure("ASR_OUTPUT_MISSING")
                 if path_key(Path(result)) != path_key(task.transcribe_srt_path):
                     raise ValueError("ASR returned an unowned output path")
                 emit(PipelineEvent("asr_completed", track.track_id, "asr", "running"))
@@ -161,7 +182,7 @@ def run_plan(plan: ExecutionPlan, *, project_root: Path | str,
 
         try:
             if token.cancelled:
-                return finish("not_started", "run_cancelled")
+                return finish("not_started", token.reason)
             for dependency in track.dependencies:
                 with lock:
                     source_result = outcomes.get(dependency)
@@ -194,38 +215,55 @@ def run_plan(plan: ExecutionPlan, *, project_root: Path | str,
                         raise ValueError("shared output owner returned a different output")
                     stage_changed("copy")
                     token.checkpoint()
-                    validate_srt(target)
+                    check_srt(target)
                     receipts.append(make_provenance(plan, track.track_id, target,
                                                    "transcription" if plan.mode == "transcribe_only" else "final"))
                     return finish("copied", "shared_representative_output", target)
                 if task.existing_subtitle_path and path_key(task.existing_subtitle_path) == path_key(target):
                     stage_changed("copy")
                     token.checkpoint()
-                    validate_srt(target)
+                    check_srt(target)
                     return finish("copied", "shared_representative_output", target)
             elif task.transcribe_srt_path.exists():
                 emit(PipelineEvent("asr_reused", track.track_id, reason="matching_provenance"))
-            runtime = TaskRuntime(stage_changed, token.checkpoint, validate, _publish_new)
             def checked_translator(source, target):
                 token.checkpoint()
-                output = translator(source, target)
+                try:
+                    output = translator(source, target)
+                except (ObserverError, PipelineCancelled, ExecutionFailure):
+                    raise
+                except Exception as exc:
+                    raise ExecutionFailure("TRANSLATION_FAILED", exc) from exc
                 if path_key(Path(output)) != path_key(target):
                     raise ValueError("translator returned an unowned output path")
                 return output
 
             def checked_opencc(source, target):
                 token.checkpoint()
-                output = opencc_converter(source, target)
+                try:
+                    output = opencc_converter(source, target)
+                except (ObserverError, PipelineCancelled, ExecutionFailure):
+                    raise
+                except Exception as exc:
+                    raise ExecutionFailure("OPENCC_FAILED", exc) from exc
                 if path_key(Path(output)) != path_key(target):
                     raise ValueError("OpenCC returned an unowned output path")
                 return output
+            def publish(source, target):
+                try:
+                    _publish_new(source, target)
+                except (ObserverError, PipelineCancelled, ExecutionFailure):
+                    raise
+                except Exception as exc:
+                    raise ExecutionFailure("OUTPUT_PUBLICATION_FAILED", exc) from exc
+            runtime = TaskRuntime(stage_changed, token.checkpoint, validate, publish)
             result = process_audio_task(
                 effective_task, project_root=project_root, faster_whisper_config=faster_whisper_config,
                 transcriber=gated_transcriber, translator=checked_translator if translator is not None else None,
                 opencc_converter=checked_opencc, runtime=runtime,
             )
             if result.output_path is not None and result.status in {"success", "copied", "transcribed"}:
-                validate_srt(result.output_path)
+                check_srt(result.output_path)
                 receipts.append(make_provenance(plan, track.track_id, result.output_path,
                                                "transcription" if plan.mode == "transcribe_only" else "final"))
             if result.status == "skipped" and result.output_path is not None:
@@ -234,9 +272,14 @@ def run_plan(plan: ExecutionPlan, *, project_root: Path | str,
         except ObserverError:
             raise
         except PipelineCancelled:
-            return finish("cancelled" if started else "not_started", "run_cancelled")
+            return finish("cancelled" if started else "not_started", token.reason)
         except Exception as exc:
-            return finish("failed", f"{type(exc).__name__}: {exc}")
+            code = exc.code if isinstance(exc, ExecutionFailure) else (
+                "SRT_VALIDATION_FAILED" if isinstance(exc, ValueError) and stage in {"translation", "opencc", "traditional_correction"} else
+                "TRANSCRIPT_CORRECTION_FAILED" if stage == "transcript_correction" else "INTERNAL_EXECUTION_ERROR")
+            failure = failure_record(code, stage, exception_type=getattr(exc, "exception_type", type(exc).__name__),
+                                     details=getattr(exc, "details", None))
+            return finish("failed", code, failure=failure)
 
     for track in plan.planned_tracks:
         emit(PipelineEvent("track_queued", track.track_id, status="queued"))

@@ -25,6 +25,7 @@ from scripts.asmr_transcribe_lib.gui_results import (
 from .run_model import RunModel
 from .diagnostics import DiagnosticLog, plan_rejection_diagnostic
 from .health import HealthMonitor
+from scripts.asmr_transcribe_lib.gui_logging import RunLogFormatter
 
 BUSY = {"SCANNING", "PREFLIGHT", "STARTING", "RUNNING", "STOPPING", "RECONCILING", "CLEANUP_FAILED"}
 
@@ -80,6 +81,8 @@ class Controller(QObject):
         self._diagnostics = DiagnosticLog(self.diagnostic_log_path)
         self.log_message.connect(self._record_diagnostic)
         self._events = queue.Queue(maxsize=2048)
+        self._log_events = queue.Queue(maxsize=4096)
+        self._log_overflow_warned = False
         self._delivery.connect(self._receive, Qt.ConnectionType.QueuedConnection)
         self._drain_timer = QTimer(self)
         self._drain_timer.setInterval(33)
@@ -108,7 +111,7 @@ class Controller(QObject):
             self.log_message.emit("lifecycle · " + state)
 
     def _record_diagnostic(self, message):
-        self._diagnostics.append(self.root, message, f"generation={self._generation} operation={self._op_id or '-'}")
+        self._diagnostics.append(self.root, message, f"generation={self._generation} operation={self._op_id or '-'} " + getattr(self, "_log_context", ""))
 
     def _invalidate(self):
         self._generation += 1
@@ -454,6 +457,7 @@ class Controller(QObject):
             self._post(intent, "phase", "STARTING")
             decoder_lock, lost = threading.Lock(), threading.Event()
             decoder = None
+            formatter = None
 
             def notify(data):
                 with decoder_lock:
@@ -462,14 +466,22 @@ class Controller(QObject):
                     try:
                         for event in decoder.feed(data):
                             self._events.put_nowait((intent.generation, intent.operation_id, event))
+                            try:
+                                lines = formatter.event(event)
+                            except Exception:
+                                lines = []
+                            if lines:
+                                self._post(intent, "run_log", lines)
                     except (ProtocolError, queue.Full):
                         lost.set()
                         self._post(intent, "delivery_gap", True)
 
             def command(managed):
-                nonlocal decoder
+                nonlocal decoder, formatter
                 digest = save_plan(plan, managed.run_dir / "plan.json")
                 decoder = JSONLDecoder(managed.run_id)
+                formatter = RunLogFormatter(plan, managed.run_id, managed.run_dir)
+                self._log_formatter = formatter
                 if self.worker_command:
                     return self.worker_command(managed)
                 return self._command(managed, "run", ["--plan", managed.run_dir / "plan.json", "--expected-digest", digest])
@@ -484,7 +496,9 @@ class Controller(QObject):
                     return
                 last_snapshot = now
                 try:
-                    recovered = reconcile_run(managed.run_dir, managed.run_id, plan.plan_hash)
+                    # Live presentation verifies receipts without repeatedly
+                    # replaying the journal. Final cleanup/resume stays strict.
+                    recovered = reconcile_run(managed.run_dir, managed.run_id, plan.plan_hash, verify_journal=False)
                     snapshot = read_json(managed.run_dir / "state.json")
                     if (snapshot.get("run_id") != managed.run_id or snapshot.get("plan_hash") != plan.plan_hash
                             or snapshot.get("schema_version") != "1.0"
@@ -518,6 +532,7 @@ class Controller(QObject):
             # Final authority is independent of delivered stdout. ManagedWorker
             # has already verified Job0/root exit and reconciled before settlement.
             result = self._enrich(cleanup.get("result", {}), managed.run_dir)
+            self._post(intent, "run_log", formatter.reconcile(result, cleanup, user_stop=intent.stop.is_set()))
             self._post(intent, "finished", (cleanup, result, managed.run_dir))
         except Exception as exc:
             self._error(intent, "RUN_FAILED", exc)
@@ -551,6 +566,8 @@ class Controller(QObject):
             if ref:
                 receipt = read_json(safe_ref(run_dir, ref))
                 track["warnings"] = receipt.get("warnings", [])
+                track["error"] = receipt.get("error")
+                track["reason"] = (receipt.get("error_code") if receipt.get("status") == "failed" else receipt.get("reason")) or track.get("reason")
         return result
 
     def _retry_cleanup(self, intent, managed):
@@ -563,6 +580,9 @@ class Controller(QObject):
                 self._owned = None
             if intent.kind == "run" and getattr(managed, "plan", None) is not None:
                 result = self._enrich(cleanup.get("result", {}), managed.run_dir)
+                formatter = getattr(self, "_log_formatter", None)
+                if formatter is not None and formatter.run_id == result.get("run_id"):
+                    self._post(intent, "run_log", formatter.reconcile(result, cleanup, user_stop=intent.stop.is_set()))
                 self._post(intent, "finished", (cleanup, result, managed.run_dir))
             else:
                 self._post(intent, "cancelled", cleanup)
@@ -593,7 +613,7 @@ class Controller(QObject):
 
     def _drain_events(self):
         started, count = time.monotonic(), 0
-        while count < 128 and time.monotonic() - started < .008:
+        while count < 64 and time.monotonic() - started < .004:
             try:
                 generation, operation_id, event = self._events.get_nowait()
             except queue.Empty:
@@ -604,8 +624,19 @@ class Controller(QObject):
             if event["run_id"] != self.run_model.run_id:
                 continue
             self.run_model.apply_event(event)
-            if event["event"] in {"stage_changed", "track_finished", "track_failed", "track_cancelled", "track_not_started"}:
-                self.log_message.emit(event["event"] + " · " + (event["stage"] or event["status"] or ""))
+        while count < 128 and time.monotonic() - started < .008:
+            try:
+                generation, operation_id, (message, context) = self._log_events.get_nowait()
+            except queue.Empty:
+                break
+            count += 1
+            if generation != self._generation or operation_id != self._op_id:
+                continue
+            self._log_context = context
+            try:
+                self.log_message.emit(message)
+            finally:
+                self._log_context = ""
 
     def _receive(self, message):
         generation, operation_id, kind, value = message
@@ -614,6 +645,15 @@ class Controller(QObject):
         if kind == "phase":
             if self.state != "STOPPING" or value == "RECONCILING":
                 self._set_state(value)
+        elif kind == "run_log":
+            for entry in value:
+                try:
+                    self._log_events.put_nowait((generation, operation_id, entry))
+                except queue.Full:
+                    if not self._log_overflow_warned:
+                        self._log_overflow_warned = True
+                        self.log_message.emit("即時日誌顯示佇列已滿；完整執行日誌請見 Run 目錄的 logs/execution.log")
+                    break
         elif kind == "catalog":
             plan, directory, historical = value
             self.run_model.load_plan(plan)
@@ -639,6 +679,7 @@ class Controller(QObject):
                 self.log_message.emit("preflight · " + backend + " · " + str(check.get("error_code") or ("AVAILABLE" if check.get("available") else "UNAVAILABLE")))
         elif kind == "begin":
             plan, run_id, directory = value
+            self._log_overflow_warned = False
             self.run_model.begin_run(plan, run_id)
             self.last_run_dir = directory
         elif kind == "delivery_gap":
@@ -651,6 +692,8 @@ class Controller(QObject):
             self.last_error = "CLEANUP_FAILED"
             self._set_state("CLEANUP_FAILED")
             self.log_message.emit("清理未確認：保留所有權，請重試停止")
+            self.log_message.emit("[批次] 清理失敗 · 結果與統計尚待核對 · cleanup=False active="
+                                  + str(value.get("active_count", "未確認")) + " · 完整日誌：" + str(self.diagnostic_log_path))
         elif kind == "finished":
             cleanup, result, directory = value
             # Drain queued notifications before applying the authoritative result.

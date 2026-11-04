@@ -22,9 +22,34 @@ def wait_json(path, timeout=15):
     while time.monotonic() < deadline:
         try:
             return json.loads(path.read_text(encoding="utf-8"))
-        except (FileNotFoundError, json.JSONDecodeError):
+        except (FileNotFoundError, PermissionError, json.JSONDecodeError):
             time.sleep(0.02)
     raise AssertionError(f"controlled fixture did not publish {path}")
+
+
+def test_wait_json_retries_transient_windows_file_sharing(tmp_path, monkeypatch):
+    path = tmp_path / "ready.json"
+    path.write_text('{"ready": true}', encoding="utf-8")
+    original = Path.read_text
+    attempts = []
+    def read(candidate, *args, **kwargs):
+        if candidate == path:
+            attempts.append(candidate)
+            if len(attempts) == 1:
+                raise PermissionError("controlled transient sharing conflict")
+        return original(candidate, *args, **kwargs)
+    monkeypatch.setattr(Path, "read_text", read)
+    assert wait_json(path) == {"ready": True}
+    assert len(attempts) == 2
+
+
+def test_wait_json_persistent_denial_remains_a_failure(tmp_path, monkeypatch):
+    path = tmp_path / "ready.json"
+    def denied(*args, **kwargs):
+        raise PermissionError("controlled persistent denial")
+    monkeypatch.setattr(Path, "read_text", denied)
+    with pytest.raises(AssertionError, match="controlled fixture did not publish"):
+        wait_json(path, timeout=.03)
 
 
 class ProcessHandles:

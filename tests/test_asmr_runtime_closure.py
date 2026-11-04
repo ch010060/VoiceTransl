@@ -1,4 +1,4 @@
-"""Dependency-ready scheduling: synthetic inference and explicit barriers."""
+"""Gate A/B regression. Real RCA timings, synthetic inference, explicit barriers."""
 from concurrent.futures import ThreadPoolExecutor
 from collections import Counter
 import io
@@ -9,9 +9,9 @@ from uuid import uuid4
 
 import pytest
 
-from scripts.asmr_transcribe_lib import pipeline
+from scripts.asmr_transcribe_lib import gui_execution, pipeline
 from scripts.asmr_transcribe_lib.gui_execution import run_plan
-from scripts.asmr_transcribe_lib.gui_plan import build_execution_plan
+from scripts.asmr_transcribe_lib.gui_plan import build_execution_plan, validate_srt
 from scripts.asmr_transcribe_lib.gui_results import RunStore, read_json, reconcile_run, resume_provenance
 from scripts.asmr_transcribe_lib.runtime import CancellationToken
 
@@ -45,6 +45,71 @@ def execute(plan, directory, *, asr=None, translate=None, convert=None, observer
                         opencc_converter=convert or copy, observer=observe, cancel_token=token)
     result = store.finish(outcomes)
     return store, outcomes, result
+
+
+@pytest.mark.parametrize("boundary,code,stage", [
+    ("asr", "ASR_EXECUTION_FAILED", "asr"),
+    ("translation", "TRANSLATION_FAILED", "translation"),
+    ("opencc", "OPENCC_FAILED", "opencc"),
+    ("publication", "OUTPUT_PUBLICATION_FAILED", "finalize"),
+])
+def test_failure_categories_have_exact_track_context_without_private_exception(tmp_path, monkeypatch, boundary, code, stage):
+    plan = build_execution_plan(library(tmp_path))
+    def fail(*args, **kwargs):
+        raise RuntimeError("PRIVATE_CAPTION_DO_NOT_LOG token=PRIVATE_SECRET https://private.invalid")
+    kwargs = {"asr": fail} if boundary == "asr" else {"translate": fail} if boundary == "translation" else {"convert": fail} if boundary == "opencc" else {}
+    if boundary == "publication":
+        monkeypatch.setattr(gui_execution, "_publish_new", fail)
+    store, outcomes, result = execute(plan, tmp_path / "run", **kwargs)
+    failed = next(o for o in outcomes if o.status == "failed")
+    receipt = read_json(store.run_dir / "receipts" / (failed.track_id + ".json"))
+    error = receipt["error"]
+    assert error["code"] == code and error["stage"] == stage
+    assert error["track_id"] == failed.track_id and error["work_id"] == plan.track_index[failed.track_id].work_id
+    assert error["audio_path"] == failed.audio_path.name and error["outcome"] == "failed"
+    assert (store.run_dir / error["diagnostic_ref"]).exists()
+    assert result["counts"]["not_started"] == 1
+    dependency = next(o for o in outcomes if o.status == "not_started")
+    assert read_json(store.run_dir / "receipts" / (dependency.track_id + ".json"))["error_code"] == "DEPENDENCY_FAILED"
+    text = "\n".join(p.read_text(encoding="utf-8") for p in store.run_dir.rglob("*") if p.is_file() and p.name != ".store")
+    assert "PRIVATE_CAPTION" not in text and "PRIVATE_SECRET" not in text and "private.invalid" not in text
+    assert reconcile_run(store.run_dir, store.run_id, plan.plan_hash)["complete"]
+
+
+def test_missing_asr_output_is_distinct(tmp_path):
+    plan = build_execution_plan(library(tmp_path, variants=False))
+    store, outcomes, _ = execute(plan, tmp_path / "run", asr=lambda **kw: kw["transcribe_srt_path"])
+    assert outcomes[0].failure["code"] == "ASR_OUTPUT_MISSING"
+
+
+@pytest.mark.parametrize("timings,valid", [
+    (["00:12:05,460 --> 00:12:05,560", "00:12:05,040 --> 00:12:19,000"], False),
+    (["00:00:30,000 --> 00:00:31,000", "00:00:00,000 --> 00:00:01,000"], False),
+    (["00:00:03,000 --> 00:00:04,000", "00:00:02,500 --> 00:00:04,000", "00:00:02,000 --> 00:00:04,000"], False),
+    (["00:00:01,000 --> 00:00:03,000", "00:00:02,000 --> 00:00:04,000"], True),
+    (["00:00:01,000 --> 00:00:01,000"], True),
+    (["00:00:02,000 --> 00:00:01,000"], False),
+])
+def test_timestamp_repair_deferred_original_text_and_order_preserved(tmp_path, timings, valid):
+    plan = build_execution_plan(library(tmp_path, variants=False), mode="transcribe_only")
+    original = "\n\n".join(f"{i}\n{timing}\nPRIVATE_CAPTION_{i}" for i, timing in enumerate(timings, 1)) + "\n"
+    def asr(*, transcribe_srt_path, **kwargs):
+        transcribe_srt_path.write_text(original, encoding="utf-8")
+        return transcribe_srt_path
+    store, outcomes, _ = execute(plan, tmp_path / "run", asr=asr)
+    transcript = plan.tracks[0].task.transcribe_srt_path
+    assert transcript.read_text(encoding="utf-8") == original
+    assert outcomes[0].status == ("transcribed" if valid else "failed")
+    if not valid:
+        error = read_json(store.run_dir / "receipts" / (plan.tracks[0].track_id + ".json"))["error"]
+        assert error["code"] == "SRT_TIMESTAMP_ORDER_INVALID"
+        assert error["details"]["automatic_repair"] == "DEFERRED"
+        if len(timings) == 3:
+            assert error["details"]["anomaly_count"] == 2
+        if "12:05" in timings[0]:
+            assert error["details"]["examples"][0]["backward_ms"] == 420
+    else:
+        validate_srt(transcript)  # Preserve existing overlap/zero-length policy.
 
 
 @pytest.mark.parametrize("mode", ["full", "transcribe_only"])
@@ -111,6 +176,24 @@ def test_ready_engine_bounds_active_futures_and_prioritizes_dependencies(tmp_pat
     assert len(outcomes) == len({o.track_id for o in outcomes}) == 16
 
 
+def test_aborted_not_started_records_are_not_user_cancelled(tmp_path):
+    plan = build_execution_plan(library(tmp_path))
+    token = CancellationToken()
+    token.cancel("run_aborted")
+    store, outcomes, result = execute(plan, tmp_path / "run", token=token)
+    assert result["outcome"] == "interrupted"
+    assert all(o.status == "not_started" and o.reason == "run_aborted" for o in outcomes)
+    assert reconcile_run(store.run_dir, store.run_id, plan.plan_hash)["outcome"] == "interrupted"
+
+
+def test_readable_log_failure_does_not_fail_a_track(tmp_path, monkeypatch):
+    from scripts.asmr_transcribe_lib.gui_logging import DiagnosticLog
+    monkeypatch.setattr(DiagnosticLog, "append", lambda *args: (_ for _ in ()).throw(OSError("PRIVATE_SECRET")))
+    plan = build_execution_plan(library(tmp_path))
+    _, _, result = execute(plan, tmp_path / "run")
+    assert result["outcome"] == "completed"
+
+
 def test_parallel_one_settles_work_before_unrelated_work_starts(tmp_path):
     plan = build_execution_plan(library(tmp_path, works=("RJ001", "RJ002")), settings={"parallel": 1})
     copied_a = threading.Event()
@@ -146,3 +229,15 @@ def test_copy_only_restart_uses_authoritative_source_without_new_inference(tmp_p
     _, outcomes, result = execute(resumed, tmp_path / "restart", asr=forbidden)
     assert result["outcome"] == "completed"
     assert Counter(o.status for o in outcomes) == {"skipped": 1, "copied": 1}
+
+
+def test_skip_only_work_has_one_truthful_summary(tmp_path):
+    root = library(tmp_path)
+    (root / "RJ001/voice01.srt").write_text(SRT, encoding="utf-8")
+    plan = build_execution_plan(root, skip_existing_subtitles=True)
+    def forbidden(**kwargs):
+        raise AssertionError("skip-only Work must not invoke ASR")
+    store, _, result = execute(plan, tmp_path / "run", asr=forbidden)
+    assert result["counts"]["skipped"] == 2
+    log = (store.run_dir / "logs/execution.log").read_text(encoding="utf-8")
+    assert log.count("作品結算") == 1 and "略過 2" in log

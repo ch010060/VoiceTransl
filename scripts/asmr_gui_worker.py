@@ -153,7 +153,7 @@ def _run(plan, args, run_dir, stream, adapters, failure_context):
             while not done.is_set():
                 available = wintypes.DWORD()
                 if not peek(handle, None, 0, None, ctypes.byref(available), None):
-                    token.cancel()
+                    token.cancel("run_aborted")
                     return
                 if not available.value:
                     done.wait(.02)
@@ -171,7 +171,7 @@ def _run(plan, args, run_dir, stream, adapters, failure_context):
         except Exception:
             if not done.is_set():
                 failures.append("CONTROL_PROTOCOL_FAILED")
-                token.cancel()
+                token.cancel("run_aborted")
 
     def heartbeat():
         try:
@@ -182,7 +182,7 @@ def _run(plan, args, run_dir, stream, adapters, failure_context):
         except Exception:
             if not done.is_set():
                 failures.append("PROTOCOL_DELIVERY_FAILED")
-                token.cancel()
+                token.cancel("run_aborted")
 
     store.start()
     threads = [threading.Thread(target=controls, daemon=True), threading.Thread(target=heartbeat, daemon=True)]

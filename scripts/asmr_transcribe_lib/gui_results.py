@@ -15,6 +15,8 @@ from uuid import uuid4
 from .gui_plan import file_stamp, is_existing_subtitle_skip, make_provenance, path_key, validate_srt, Provenance
 from .gui_protocol import (JSONLDecoder, ProtocolError, ReconciliationRequired,
                            TERMINAL, VERSION, check_version, uuid_text, validate_event)
+from .gui_errors import ERROR_REASONS, curate_failure
+from .gui_logging import DiagnosticLog, RunLogFormatter
 
 
 def _json_bytes(value) -> bytes:
@@ -70,6 +72,14 @@ def _summary(tracks: dict) -> dict:
     return counts
 
 
+def _run_outcome(counts, reasons, requested=False):
+    if counts["failed"]:
+        return "completed_with_errors", 1
+    if counts["cancelled"] or counts["not_started"]:
+        return ("cancelled" if requested or "run_cancelled" in reasons else "interrupted"), 2
+    return "completed", 0
+
+
 def _identity(track, mode, settings_hash) -> dict:
     role = "transcription" if mode == "transcribe_only" and track.task.action != "skip" else "final"
     output = track.task.transcribe_srt_path if role == "transcription" else track.task.final_srt_path
@@ -110,6 +120,8 @@ def _native_warnings(metadata, status):
 class RunStore:
     def __init__(self, run_dir, run_id, plan, stream, *, asr_metadata=None):
         self.run_dir = Path(run_dir).resolve()
+        if self.run_dir.is_relative_to(plan.root.resolve()):
+            raise ValueError("run records must be outside audio library")
         self.run_id = uuid_text(run_id)
         self.plan = plan
         self.stream = stream
@@ -138,6 +150,8 @@ class RunStore:
                           t.track_id: {"work_id": t.work_id, "revision": 0, "status": None}
                           for t in plan.planned_tracks}, "controls": {}}
         self._save_state()
+        self._readable = DiagnosticLog(self.run_dir / "logs" / "execution.log")
+        self._log_formatter = RunLogFormatter(plan, self.run_id, self.run_dir)
 
     def _save_state(self):
         self.state["counts"] = _summary(self.state["tracks"])
@@ -175,6 +189,13 @@ class RunStore:
                 os.fsync(journal.fileno())
             self.stream.write(encoded.decode("utf-8"))
             self.stream.flush()
+            # Human logs are optional presentation; protocol/receipt I/O above
+            # remains authoritative and must still fail closed.
+            try:
+                for message, context in self._log_formatter.event(record):
+                    self._readable.append(self.plan.root, message, context)
+            except Exception:
+                pass
             return record
 
     def start(self) -> None:
@@ -238,6 +259,17 @@ class RunStore:
                    "error_code": "TRACK_EXECUTION_FAILED" if event.status == "failed" else None,
                    "dependencies": list(track.dependencies),
                    "revision": self.state["tracks"][track.track_id]["revision"] + 1}
+        if event.failure is not None or event.status == "failed":
+            error = {**curate_failure(event.failure, event.stage), "work_id": track.work_id,
+                     "track_id": track.track_id, "outcome": event.status,
+                     "audio_path": track.task.audio_path.relative_to(track.task.work_dir).as_posix()}
+            ref = "logs/" + track.track_id + ".error.json"
+            error["diagnostic_ref"] = ref
+            try:
+                atomic_json(safe_ref(self.run_dir, ref), error)
+            except OSError:
+                error["diagnostic_ref"] = "receipts/" + track.track_id + ".json"
+            receipt.update(error=error, error_code=error["code"])
         if track.shared_output_owner and event.status == "copied":
             owner_state = self.state["tracks"][track.shared_output_owner]
             if not owner_state.get("receipt_ref"):
@@ -291,7 +323,8 @@ class RunStore:
                 if name == "track_finished":
                     payload.update(outcome=status, output_ids=[receipt["output_type"]], warnings=receipt["warnings"])
                 elif name == "track_failed":
-                    payload["error"] = {"code": "TRACK_EXECUTION_FAILED", "retryable": True, "detail_ref": ref}
+                    payload["error"] = {"code": receipt["error_code"], "retryable": True,
+                                        "detail_ref": receipt.get("error", {}).get("diagnostic_ref", ref)}
                 else:
                     payload["reason"] = event.reason if event.reason in {"dependency_failed", "run_cancelled", "run_aborted"} else "run_aborted"
                     if name == "track_cancelled":
@@ -354,7 +387,8 @@ class RunStore:
                     if terminal_proofs and receipt["provenance"] not in terminal_proofs:
                         raise ProtocolError("result provenance differs from terminal receipt")
             counts = _summary(self.state["tracks"])
-            outcome, code = ("completed_with_errors", 1) if counts["failed"] else (("cancelled", 2) if counts["cancelled"] or counts["not_started"] else ("completed", 0))
+            reasons = [read_json(safe_ref(self.run_dir, t["receipt_ref"])).get("reason") for t in self.state["tracks"].values()]
+            outcome, code = _run_outcome(counts, reasons, self.state.get("cancel_requested", False))
             result = {"schema_version": VERSION, "run_id": self.run_id, "plan_hash": self.plan.plan_hash,
                       "outcome": outcome, "counts": counts, "exit_code": code, "complete": True,
                       "tracks": {k: {key: value[key] for key in ("status", "receipt_ref", "receipt_hash", "revision")}
@@ -364,6 +398,12 @@ class RunStore:
             self.emit("run_finished", status=outcome, payload={"outcome": outcome, "counts": counts,
                       "result_ref": "result.json", "result_hash": _digest(result)})
             self.finished = True
+            try:
+                for message, context in self._log_formatter.reconcile(result, {}):
+                    self._readable.append(self.plan.root, message, context)
+            except Exception:
+                pass
+            self._readable.close(wait=True)
             return result
 
 
@@ -382,6 +422,14 @@ def _verify_receipt(run_dir, manifest, track_id, stored):
     if receipt.get("status") != stored.get("status") or receipt.get("revision") != stored.get("revision") or receipt.get("status") not in TERMINAL:
         raise ProtocolError("receipt revision or outcome mismatch")
     status = receipt["status"]
+    error = receipt.get("error")
+    if error is not None:
+        if (not isinstance(error, dict) or error.get("work_id") != expected["work_id"]
+                or error.get("track_id") != track_id or error.get("outcome") != status
+                or error.get("code") not in ERROR_REASONS or receipt.get("error_code") != error["code"]
+                or error.get("reason") != ERROR_REASONS[error["code"]]):
+            raise ProtocolError("receipt failure identity mismatch")
+        safe_ref(run_dir, error.get("diagnostic_ref"))
     existing_subtitle = expected.get("output_type") == "existing_subtitle"
     if existing_subtitle and status in {"success", "copied", "transcribed"}:
         raise ProtocolError("existing subtitle cannot certify a completed stage")
@@ -431,7 +479,7 @@ def _verify_receipt(run_dir, manifest, track_id, stored):
     return receipt
 
 
-def reconcile_run(run_dir, run_id, plan_hash, exit_code=None) -> dict:
+def reconcile_run(run_dir, run_id, plan_hash, exit_code=None, *, verify_journal=True) -> dict:
     """Read-only reconciliation. Controller records recovery only after cleanup."""
     run_dir = Path(run_dir).resolve()
     uuid_text(run_id)
@@ -463,13 +511,14 @@ def reconcile_run(run_dir, run_id, plan_hash, exit_code=None) -> dict:
     terminal_notice = None
     journal_events = []
     try:
-        with safe_ref(run_dir, "events.jsonl").open("rb") as journal:
-            while chunk := journal.read(64 * 1024):
-                for event in decoder.feed(chunk):
-                    journal_events.append(event)
-                    if event["event"] == "run_finished":
-                        terminal_notice = event
-        decoder.finish()
+        if verify_journal:
+            with safe_ref(run_dir, "events.jsonl").open("rb") as journal:
+                while chunk := journal.read(64 * 1024):
+                    for event in decoder.feed(chunk):
+                        journal_events.append(event)
+                        if event["event"] == "run_finished":
+                            terminal_notice = event
+            decoder.finish()
     except (ReconciliationRequired, OSError):
         warnings.append("JOURNAL_RECONCILIATION_REQUIRED")
     except ProtocolError as exc:
@@ -486,7 +535,7 @@ def reconcile_run(run_dir, run_id, plan_hash, exit_code=None) -> dict:
             refs.append(payload["error"]["detail_ref"])
         for ref in refs:
             safe_ref(run_dir, ref)
-    if decoder.last_seq != state.get("last_seq"):
+    if verify_journal and decoder.last_seq != state.get("last_seq"):
         warnings.append("JOURNAL_SNAPSHOT_DIFFER")
     result_path = safe_ref(run_dir, "result.json")
     result = None
@@ -512,7 +561,8 @@ def reconcile_run(run_dir, run_id, plan_hash, exit_code=None) -> dict:
             raise ProtocolError("result differs from authoritative receipts")
         if not failure_result and ("tracks" not in result or len(recovered) != len(manifest["tracks"])):
             raise ProtocolError("result lacks planned outcomes")
-        expected = ("completed_with_errors", 1) if counts["failed"] else (("cancelled", 2) if counts["cancelled"] or counts["not_started"] else ("completed", 0))
+        reasons = [read_json(safe_ref(run_dir, t["receipt_ref"])).get("reason") for t in recovered.values()]
+        expected = _run_outcome(counts, reasons, state.get("cancel_requested", False))
         if not failure_result and (result.get("outcome"), result.get("exit_code")) != expected:
             raise ProtocolError("result success or exit code contradicts outcomes")
         if terminal_notice and (terminal_notice["payload"].get("result_ref") != "result.json" or
