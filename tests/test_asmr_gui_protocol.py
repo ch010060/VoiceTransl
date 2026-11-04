@@ -418,7 +418,10 @@ def test_native_asr_exit_metadata_is_durable_and_redacted(tmp_path, code, known,
     assert receipt["native_metadata"] == public
     assert receipt["status"] == ("failed" if fail else "success")
     assert receipt["warnings"] == ([warning] if warning else [])
-    assert "private" not in json.dumps(receipt) and "private" not in stream.getvalue()
+    # macOS canonical temporary paths include /private/; check actual fixture secrets.
+    for secret in ("private caption and key", "private native log", "secret password caption private",
+                   "private 台詞 never in events"):
+        assert secret not in json.dumps(receipt, ensure_ascii=False) and secret not in stream.getvalue()
     assert recovered["outcome"] == ("completed_with_errors" if fail else "completed")
 
 

@@ -191,7 +191,7 @@ def _run(plan, args, run_dir, stream, adapters, failure_context):
     try:
         selected = _adapters(plan, native_metadata) if adapters is None else {key: value for key, value in adapters.items() if key != "preflight"}
         results = run_plan(plan, project_root=Path(args.project_root), observer=store.observer,
-                           cancel_token=token, **selected)
+                           cancel_token=token, normalization_store=store.record_normalization, **selected)
     finally:
         done.set()
         for thread in threads:

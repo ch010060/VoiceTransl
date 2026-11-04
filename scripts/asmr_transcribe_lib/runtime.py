@@ -39,6 +39,7 @@ class PipelineEvent:
     status: str | None = None
     progress: tuple[float, float, float] | None = None
     reason: str | None = None
+    warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

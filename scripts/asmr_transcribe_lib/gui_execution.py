@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 import inspect
+import hashlib
 import os
 from pathlib import Path
 import shutil
@@ -14,6 +15,7 @@ from .gui_plan import (ExecutionPlan, Provenance, file_stamp, is_existing_subtit
 from .local_faster_whisper import FasterWhisperConfig, find_faster_whisper_model_dir, run_faster_whisper_transcription
 from .pipeline import TaskResult, process_audio_task, run_tasks
 from .runtime import CancellationToken, ObserverError, PipelineCancelled, PipelineEvent, TaskRuntime
+from .srt_normalization import normalize_srt_bytes, TimestampOrderError, WARNING_CODE
 
 
 @dataclass(frozen=True)
@@ -67,7 +69,8 @@ def run_plan(plan: ExecutionPlan, *, project_root: Path | str,
              translator: Callable | None, transcriber: Callable = run_faster_whisper_transcription,
              opencc_converter: Callable, parallel: int | None = None,
              observer: Callable[[PipelineEvent], None] | None = None,
-             cancel_token: CancellationToken | None = None) -> list[TrackOutcome]:
+             cancel_token: CancellationToken | None = None,
+             normalization_store: Callable | None = None) -> list[TrackOutcome]:
     """Execute a checked plan through the existing scheduler (no new scheduler).
 
     Ordinary failures are isolated only here. Legacy run_tasks callers retain
@@ -100,6 +103,8 @@ def run_plan(plan: ExecutionPlan, *, project_root: Path | str,
         track = planned[task.audio_path]
         started = False
         receipts = []
+        timestamp_warnings = []
+        normalized_stamp = None
         stage = None
         expected_inventory = dict(plan.inventory)
 
@@ -110,19 +115,25 @@ def run_plan(plan: ExecutionPlan, *, project_root: Path | str,
         def stage_changed(name):
             nonlocal stage
             stage = name
+            if name == "transcript_correction" and normalized_stamp is not None:
+                if file_stamp(task.transcribe_srt_path) != normalized_stamp:
+                    raise ValueError("normalized ASR output changed before correction")
             emit(PipelineEvent("stage_changed", track.track_id, name, "running"))
             if name == "waiting_asr":
                 for path in [task.transcribe_srt_path, task.translate_srt_path, task.opencc_srt_path]:
                     unchanged(path)
 
         def finish(status, reason, output=None, warnings=()):
+            warnings = tuple(dict.fromkeys((*warnings, *timestamp_warnings)))
             result = TrackOutcome(status, reason, task.audio_path, output, track.track_id,
                                   warnings, tuple(receipts))
             with lock:
                 outcomes[track.track_id] = result
             event = {"failed": "track_failed", "cancelled": "track_cancelled",
                      "not_started": "track_not_started"}.get(status, "track_finished")
-            emit(PipelineEvent(event, track.track_id, stage, status, reason=reason if status != "failed" else "track_exception"))
+            error_reason = reason if reason.startswith("SRT_TIMESTAMP_ORDER_INVALID:") else "track_exception"
+            emit(PipelineEvent(event, track.track_id, stage, status,
+                               reason=reason if status != "failed" else error_reason, warnings=warnings))
             return result
 
         def validate(path):
@@ -133,7 +144,21 @@ def run_plan(plan: ExecutionPlan, *, project_root: Path | str,
             if kind:
                 receipts.append(make_provenance(plan, track.track_id, path, kind))
 
+        def check_normalized_outputs():
+            if timestamp_warnings:
+                token.checkpoint()
+                if file_stamp(task.audio_path) != track.source_stamp:
+                    raise ValueError("source changed after normalization")
+                for proof in receipts:
+                    if hashlib.sha256(Path(proof.output_key).read_bytes()).hexdigest() != proof.output_hash:
+                        raise ValueError("validated stage output changed after normalization")
+
+        def publish(source, target):
+            check_normalized_outputs()
+            _publish_new(source, target)
+
         def gated_transcriber(**kwargs):
+            nonlocal normalized_stamp
             while not transcribe_semaphore.acquire(timeout=0.05):
                 token.checkpoint()
             try:
@@ -154,6 +179,43 @@ def run_plan(plan: ExecutionPlan, *, project_root: Path | str,
                 result = transcriber(**kwargs)
                 if path_key(Path(result)) != path_key(task.transcribe_srt_path):
                     raise ValueError("ASR returned an unowned output path")
+                token.checkpoint()
+                if file_stamp(task.audio_path) != track.source_stamp:
+                    raise ValueError("source changed during ASR")
+                try:
+                    validate_srt(Path(result))
+                except ValueError:
+                    stamp = file_stamp(Path(result))
+                    raw = Path(result).read_bytes()
+                    if hashlib.sha256(raw).hexdigest() != stamp[-1]:
+                        raise ValueError("ASR output changed while reading")
+                    normalized, changes = normalize_srt_bytes(raw)
+                    if not changes:
+                        raise TimestampOrderError("strict_validation")
+                    if normalization_store is None:
+                        raise TimestampOrderError("audit_store_required")
+                    normalization_store(track.track_id, raw, normalized, changes)
+                    temporary = task.transcribe_srt_path.with_name(task.transcribe_srt_path.name + ".tmp")
+                    created = False
+                    try:
+                        with temporary.open("xb") as output:
+                            created = True
+                            output.write(normalized)
+                            output.flush()
+                            os.fsync(output.fileno())
+                        validate_srt(temporary)
+                        token.checkpoint()
+                        if (file_stamp(task.audio_path) != track.source_stamp or
+                                file_stamp(Path(result)) != stamp):
+                            raise ValueError("source or ASR output changed before normalization publication")
+                        os.replace(temporary, result)
+                        normalized_stamp = file_stamp(Path(result))
+                        if normalized_stamp[-1] != hashlib.sha256(normalized).hexdigest():
+                            raise ValueError("normalized ASR output changed during publication")
+                    finally:
+                        if created:
+                            temporary.unlink(missing_ok=True)
+                    timestamp_warnings.append(WARNING_CODE)
                 emit(PipelineEvent("asr_completed", track.track_id, "asr", "running"))
                 return result
             finally:
@@ -205,7 +267,7 @@ def run_plan(plan: ExecutionPlan, *, project_root: Path | str,
                     return finish("copied", "shared_representative_output", target)
             elif task.transcribe_srt_path.exists():
                 emit(PipelineEvent("asr_reused", track.track_id, reason="matching_provenance"))
-            runtime = TaskRuntime(stage_changed, token.checkpoint, validate, _publish_new)
+            runtime = TaskRuntime(stage_changed, token.checkpoint, validate, publish)
             def checked_translator(source, target):
                 token.checkpoint()
                 output = translator(source, target)
@@ -225,6 +287,7 @@ def run_plan(plan: ExecutionPlan, *, project_root: Path | str,
                 opencc_converter=checked_opencc, runtime=runtime,
             )
             if result.output_path is not None and result.status in {"success", "copied", "transcribed"}:
+                check_normalized_outputs()
                 validate_srt(result.output_path)
                 receipts.append(make_provenance(plan, track.track_id, result.output_path,
                                                "transcription" if plan.mode == "transcribe_only" else "final"))
@@ -235,6 +298,8 @@ def run_plan(plan: ExecutionPlan, *, project_root: Path | str,
             raise
         except PipelineCancelled:
             return finish("cancelled" if started else "not_started", "run_cancelled")
+        except TimestampOrderError as exc:
+            return finish("failed", str(exc))
         except Exception as exc:
             return finish("failed", f"{type(exc).__name__}: {exc}")
 

@@ -15,6 +15,8 @@ from uuid import uuid4
 from .gui_plan import file_stamp, is_existing_subtitle_skip, make_provenance, path_key, validate_srt, Provenance
 from .gui_protocol import (JSONLDecoder, ProtocolError, ReconciliationRequired,
                            TERMINAL, VERSION, check_version, uuid_text, validate_event)
+from .srt_normalization import (normalize_srt_bytes, WARNING_CODE, MAX_BACKWARD_MS_PER_CUE,
+                                MAX_REVERSED_CUES, MAX_REVERSED_PERCENT)
 
 
 def _json_bytes(value) -> bytes:
@@ -122,6 +124,7 @@ class RunStore:
         self.finished = False
         self.controls = {}
         self.reused_tracks = set()
+        self.normalizations = {}
         self.run_dir.mkdir(parents=True, exist_ok=True)
         if any(p.name not in {"plan.json"} for p in self.run_dir.iterdir()):
             raise FileExistsError("run store is not new")
@@ -142,6 +145,53 @@ class RunStore:
     def _save_state(self):
         self.state["counts"] = _summary(self.state["tracks"])
         atomic_json(self.run_dir / "state.json", self.state)
+
+    def record_normalization(self, track_id, raw, normalized, changes):
+        """Private, run-owned evidence prepared before replacing a fresh ASR file.
+
+        Retained with the run (including failed/cancelled attempts); never copied
+        to the audio library or public event stream. No independent cleanup.
+        """
+        with self.lock:
+            track = self.plan.track_index[track_id]
+            if (track_id not in self.identities or track_id in self.normalizations
+                    or track.task.action != "process" or track.shared_output_owner
+                    or self.state["tracks"][track_id].get("status") != "running"
+                    or self.run_dir.is_relative_to(self.plan.root.resolve())
+                    or dict(self.plan.inventory)[track.task.transcribe_srt_path][-1] is not None
+                    or file_stamp(track.task.audio_path) != track.source_stamp):
+                raise ProtocolError("normalization is not a fresh owned ASR output")
+            expected, expected_changes = normalize_srt_bytes(raw)
+            if not changes or expected != normalized or expected_changes != changes:
+                raise ProtocolError("invalid normalization evidence")
+            prefix = "logs/srt-normalization/" + track_id
+            audit = {"code": WARNING_CODE, "track_id": track_id, "plan_hash": self.plan.plan_hash,
+                     "algorithm": "start-order-v1",
+                     "policy": {"max_backward_ms_per_cue": MAX_BACKWARD_MS_PER_CUE,
+                                "max_reversed_cues": MAX_REVERSED_CUES,
+                                "max_reversed_percent": MAX_REVERSED_PERCENT},
+                     "source_stamp": list(track.source_stamp), "settings_hash": self.plan.settings_hash,
+                     "transcription_key": path_key(track.task.transcribe_srt_path),
+                     "raw_ref": prefix + ".raw.srt", "normalized_ref": prefix + ".normalized.srt",
+                     "raw_hash": hashlib.sha256(raw).hexdigest(),
+                     "normalized_hash": hashlib.sha256(normalized).hexdigest(),
+                     "repaired_cues": len(changes),
+                     "max_displacement_ms": max(c["displacement_ms"] for c in changes),
+                     "total_displacement_ms": sum(c["displacement_ms"] for c in changes),
+                     "changes": changes}
+            for ref, data in ((audit["raw_ref"], raw), (audit["normalized_ref"], normalized)):
+                path = safe_ref(self.run_dir, ref)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with path.open("xb") as output:
+                    output.write(data)
+                    output.flush()
+                    os.fsync(output.fileno())
+            ref = prefix + ".json"
+            path = safe_ref(self.run_dir, ref)
+            if path.exists():
+                raise ProtocolError("normalization audit already exists")
+            atomic_json(path, audit)
+            self.normalizations[track_id] = {"ref": ref, "hash": _digest(audit)}
 
     def emit(self, event, *, work_id=None, track_id=None, stage=None, status=None, payload=None) -> dict:
         with self.lock:
@@ -230,6 +280,11 @@ class RunStore:
             # A skip records an existing file, never certifies a completed stage.
             warnings = ["unverified_legacy"] if track.verification == "unverified_legacy" else []
         warnings.extend(native_warnings)
+        normalization = self.normalizations.get(track.track_id)
+        if WARNING_CODE in event.warnings:
+            if normalization is None:
+                raise ProtocolError("normalization warning lacks controlled evidence")
+            warnings.append(WARNING_CODE)
         receipt = {"schema_version": VERSION, "run_id": self.run_id, "plan_hash": self.plan.plan_hash,
                    **identity, "status": event.status, "output_hash": output_hash,
                    "provenance": provenance, "warnings": warnings,
@@ -238,6 +293,12 @@ class RunStore:
                    "error_code": "TRACK_EXECUTION_FAILED" if event.status == "failed" else None,
                    "dependencies": list(track.dependencies),
                    "revision": self.state["tracks"][track.track_id]["revision"] + 1}
+        if normalization is not None:
+            receipt["timestamp_normalization"] = normalization
+            _verify_normalization(self.run_dir, receipt)
+        if event.status == "failed" and str(event.reason).startswith("SRT_TIMESTAMP_ORDER_INVALID:"):
+            receipt["error_code"] = "SRT_TIMESTAMP_ORDER_INVALID"
+            receipt["timestamp_error"] = event.reason.split(":", 1)[1]
         if track.shared_output_owner and event.status == "copied":
             owner_state = self.state["tracks"][track.shared_output_owner]
             if not owner_state.get("receipt_ref"):
@@ -291,7 +352,7 @@ class RunStore:
                 if name == "track_finished":
                     payload.update(outcome=status, output_ids=[receipt["output_type"]], warnings=receipt["warnings"])
                 elif name == "track_failed":
-                    payload["error"] = {"code": "TRACK_EXECUTION_FAILED", "retryable": True, "detail_ref": ref}
+                    payload["error"] = {"code": receipt["error_code"], "retryable": True, "detail_ref": ref}
                 else:
                     payload["reason"] = event.reason if event.reason in {"dependency_failed", "run_cancelled", "run_aborted"} else "run_aborted"
                     if name == "track_cancelled":
@@ -373,6 +434,43 @@ def _validate_identity(record, run_id, plan_hash):
         raise ProtocolError("stored run or plan identity mismatch")
 
 
+def _verify_normalization(run_dir, receipt):
+    link = receipt.get("timestamp_normalization")
+    if link is None:
+        if WARNING_CODE in receipt["warnings"]:
+            raise ProtocolError("normalization warning lacks evidence")
+        return
+    if not isinstance(link, dict) or set(link) != {"ref", "hash"}:
+        raise ProtocolError("invalid normalization reference")
+    if receipt["status"] in {"success", "transcribed"} and WARNING_CODE not in receipt["warnings"]:
+        raise ProtocolError("normalization receipt warning missing")
+    try:
+        audit = read_json(safe_ref(run_dir, link["ref"]))
+    except OSError as exc:
+        raise ProtocolError("normalization audit missing") from exc
+    if (_digest(audit) != link["hash"] or audit.get("code") != WARNING_CODE
+            or audit.get("algorithm") != "start-order-v1"
+            or audit.get("policy") != {"max_backward_ms_per_cue": MAX_BACKWARD_MS_PER_CUE,
+                                     "max_reversed_cues": MAX_REVERSED_CUES,
+                                     "max_reversed_percent": MAX_REVERSED_PERCENT}
+            or any(audit.get(k) != receipt[k] for k in ("track_id", "plan_hash", "source_stamp", "settings_hash"))):
+        raise ProtocolError("normalization audit identity or hash mismatch")
+    try:
+        raw = safe_ref(run_dir, audit["raw_ref"]).read_bytes()
+        normalized = safe_ref(run_dir, audit["normalized_ref"]).read_bytes()
+        expected, changes = normalize_srt_bytes(raw)
+        if (not changes or expected != normalized or changes != audit["changes"]
+                or hashlib.sha256(raw).hexdigest() != audit["raw_hash"]
+                or hashlib.sha256(normalized).hexdigest() != audit["normalized_hash"]
+                or len(changes) != audit["repaired_cues"]
+                or max(c["displacement_ms"] for c in changes) != audit["max_displacement_ms"]
+                or sum(c["displacement_ms"] for c in changes) != audit["total_displacement_ms"]):
+            raise ValueError("normalization bytes or summary differ")
+        validate_srt(safe_ref(run_dir, audit["normalized_ref"]))
+    except (KeyError, OSError, ValueError) as exc:
+        raise ProtocolError("normalization evidence missing or invalid") from exc
+
+
 def _verify_receipt(run_dir, manifest, track_id, stored):
     receipt = read_json(safe_ref(run_dir, stored["receipt_ref"]))
     _validate_identity(receipt, manifest["run_id"], manifest["plan_hash"])
@@ -388,6 +486,7 @@ def _verify_receipt(run_dir, manifest, track_id, stored):
     native_warnings = _native_warnings(receipt.get("native_metadata"), status)
     if not isinstance(receipt.get("warnings"), list) or any(warning not in receipt["warnings"] for warning in native_warnings):
         raise ProtocolError("native ASR receipt warning missing")
+    _verify_normalization(run_dir, receipt)
     if existing_subtitle and (receipt.get("provenance") is not None or
                               (status == "skipped" and "unverified_legacy" not in receipt["warnings"])):
         raise ProtocolError("existing subtitle receipt claims verification")
