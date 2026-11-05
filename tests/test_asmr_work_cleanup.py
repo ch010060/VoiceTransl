@@ -21,6 +21,78 @@ from test_asmr_gui_cleanup import prepare, execute, intermediates, SRT
 from test_asmr_gui_srt_normalization import RAW
 
 
+@pytest.mark.parametrize("keep", [False, True])
+@pytest.mark.parametrize("stop", [None, "run_cancelled", "run_aborted"])
+def test_failed_representative_with_unstarted_copy_does_not_interrupt_success_cleanup(tmp_path, keep, stop):
+    from scripts.asmr_transcribe_lib.srt_utils import SubtitleBlock, format_srt
+    from test_asmr_srt_normalization import ts
+    names = ("work/WAV/Track01_good.flac", "work/MP3/Track01_good.mp3",
+             "work/WAV/Track02_bad.flac", "work/MP3/Track02_bad.mp3")
+    plan, store = prepare(tmp_path, keep=keep, names=names)
+    good, bad = [next(t for t in plan.tracks if t.task.audio_path.name == name)
+                 for name in ("Track01_good.flac", "Track02_bad.flac")]
+    dependent = next(t for t in plan.tracks if t.task.audio_path.name == "Track02_bad.mp3")
+    # Same numeric shape as the real failure: cue 37 regresses 220 ms, 1/45 > 2%.
+    blocks = [SubtitleBlock(str(i + 1), ts(i * 9800) + " --> " + ts(i * 9800 + 9000),
+                            (f"Synthetic cue {i + 1}",)) for i in range(45)]
+    blocks[35] = SubtitleBlock("36", "00:05:44,140 --> 00:05:44,640", ("Synthetic cue 36",))
+    blocks[36] = SubtitleBlock("37", "00:05:43,920 --> 00:05:45,760", ("Synthetic cue 37",))
+    invalid = format_srt(blocks).encode()
+    good_copy_finished = threading.Event()
+    token = CancellationToken()
+    checkpoint_at_terminal = []
+
+    def asr(*, audio_path, transcribe_srt_path, **kwargs):
+        if audio_path == bad.task.audio_path:
+            assert good_copy_finished.wait(10)
+        transcribe_srt_path.write_bytes(invalid if audio_path == bad.task.audio_path else SRT)
+        return transcribe_srt_path
+
+    def copy(source, target):
+        target.write_bytes(source.read_bytes())
+        return target
+
+    def observe(event):
+        store.observer(event)
+        if event.status == "copied":
+            good_copy_finished.set()
+        if event.track_id == bad.track_id and event.status == "failed" and stop:
+            if stop == "run_cancelled":
+                store.ack_control({"schema_version": "1.0", "run_id": store.run_id,
+                                   "request_id": str(uuid4()), "command": "cancel", "payload": {}}, token)
+            else:
+                token.cancel(stop)
+        if all(t["status"] in {"success", "copied", "failed", "not_started"}
+               for t in store.state["tracks"].values()):
+            checkpoint_at_terminal.append(read_json(store.run_dir / "intermediate_cleanup.json"))
+
+    outcomes = run_plan(plan, project_root=tmp_path, transcriber=asr, translator=copy,
+                        opencc_converter=copy, observer=observe, cancel_token=token,
+                        normalization_store=store.record_normalization,
+                        intermediate_store=store.intermediate_cleanup.capture)
+    result = store.finish(outcomes)
+    assert result["counts"] == {"success": 1, "copied": 1, "failed": 1, "not_started": 1,
+                                "cancelled": 0, "transcribed": 0, "skipped": 0}
+    assert bad.task.transcribe_srt_path.read_bytes() == invalid
+    assert not bad.task.final_srt_path.exists() and not dependent.task.final_srt_path.exists()
+    failure = read_json(store.run_dir / "receipts" / (bad.track_id + ".json"))
+    assert failure["error_code"] == "SRT_TIMESTAMP_ORDER_INVALID"
+    assert failure["error"]["details"]["normalization_rejection"] == "ratio_limit"
+    assert failure["provenance"] is None
+    assert result["intermediate_cleanup"].keys() == {good.track_id}
+    expected = "disabled" if keep else "deferred_interrupted" if stop else "completed"
+    assert checkpoint_at_terminal[-1]["works"][good.work_id]["tracks"][good.track_id]["status"] == expected
+    assert result["intermediate_cleanup"][good.track_id]["status"] == expected
+    assert all(p.exists() == bool(keep or stop) for p in intermediates(good))
+    assert result["warnings"] == ([WARNING] if stop and not keep else [])
+    recovered = reconcile_run(store.run_dir, store.run_id, plan.plan_hash)
+    assert recovered["complete"] and recovered["counts"] == result["counts"]
+    if not stop:
+        receipt = read_json(store.run_dir / "receipts" / (dependent.track_id + ".json"))
+        assert receipt["reason"] == "dependency_failed" and receipt["provenance"] is None
+        assert receipt["error_code"] == "DEPENDENCY_FAILED"
+
+
 @pytest.mark.parametrize("mode,keep,cross_reader,stop_b", [
     ("full", False, False, False), ("full", True, False, False),
     ("transcribe_only", False, False, False), ("full", False, True, False),

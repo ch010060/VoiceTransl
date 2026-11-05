@@ -198,7 +198,10 @@ def cleanup_completed_work(run_dir, run_id, work_id, cleanup, *, retry=False):
         atomic_json(safe_ref(run_dir, "intermediate_cleanup.json"), checkpoint)
     try:
         records = cleanup.run(ids, receipts, entry["tracks"], persist, interrupted=bool(
-            state.get("cancel_requested") or any(receipts[key]["status"] in {"cancelled", "not_started"} for key in ids)))
+            state.get("cancel_requested") or any(
+                receipts[key]["status"] == "cancelled" or
+                (receipts[key]["status"] == "not_started" and receipts[key].get("reason") != "dependency_failed")
+                for key in ids)))
         statuses = {record["status"] for record in records.values()}
         entry["status"] = ("completed" if statuses <= {"completed", "disabled"} else
                            "deferred_dependencies" if statuses == {"deferred_dependencies"} else
