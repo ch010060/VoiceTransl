@@ -32,11 +32,13 @@ def test_failed_representative_with_unstarted_copy_does_not_interrupt_success_cl
     good, bad = [next(t for t in plan.tracks if t.task.audio_path.name == name)
                  for name in ("Track01_good.flac", "Track02_bad.flac")]
     dependent = next(t for t in plan.tracks if t.task.audio_path.name == "Track02_bad.mp3")
-    # Same numeric shape as the real failure: cue 37 regresses 220 ms, 1/45 > 2%.
+    # Two reversals remain over the 2% limit after the single-reversal fallback.
     blocks = [SubtitleBlock(str(i + 1), ts(i * 9800) + " --> " + ts(i * 9800 + 9000),
                             (f"Synthetic cue {i + 1}",)) for i in range(45)]
     blocks[35] = SubtitleBlock("36", "00:05:44,140 --> 00:05:44,640", ("Synthetic cue 36",))
     blocks[36] = SubtitleBlock("37", "00:05:43,920 --> 00:05:45,760", ("Synthetic cue 37",))
+    blocks[40] = SubtitleBlock("41", ts(39 * 9800 - 220) + " --> " + ts(40 * 9800 + 9000),
+                               ("Synthetic cue 41",))
     invalid = format_srt(blocks).encode()
     good_copy_finished = threading.Event()
     token = CancellationToken()

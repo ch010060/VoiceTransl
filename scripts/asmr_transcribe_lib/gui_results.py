@@ -19,7 +19,7 @@ from .gui_protocol import (JSONLDecoder, ProtocolError, ReconciliationRequired,
 from .gui_errors import ERROR_REASONS, curate_failure
 from .gui_logging import DiagnosticLog, RunLogFormatter
 from .srt_normalization import (normalize_srt_bytes, WARNING_CODE, MAX_BACKWARD_MS_PER_CUE,
-                                MAX_REVERSED_CUES, MAX_REVERSED_PERCENT)
+                                MAX_REVERSED_CUES, MAX_REVERSED_PERCENT, FALLBACK_WARNING_CODE)
 
 
 def _json_bytes(value) -> bytes:
@@ -288,6 +288,8 @@ class RunStore:
                      "max_displacement_ms": max(c["displacement_ms"] for c in changes),
                      "total_displacement_ms": sum(c["displacement_ms"] for c in changes),
                      "changes": changes}
+            if changes[0].get("fallback"):
+                audit["fallback"] = changes[0]["fallback"]
             for ref, data in ((audit["raw_ref"], raw), (audit["normalized_ref"], normalized)):
                 path = safe_ref(self.run_dir, ref)
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -397,10 +399,11 @@ class RunStore:
             warnings = ["unverified_legacy"] if track.verification == "unverified_legacy" else []
         warnings.extend(native_warnings)
         normalization = self.normalizations.get(track.track_id)
-        if WARNING_CODE in event.warnings:
-            if normalization is None:
-                raise ProtocolError("normalization warning lacks controlled evidence")
-            warnings.append(WARNING_CODE)
+        for warning in (WARNING_CODE, FALLBACK_WARNING_CODE):
+            if warning in event.warnings:
+                if normalization is None:
+                    raise ProtocolError("normalization warning lacks controlled evidence")
+                warnings.append(warning)
         receipt = {"schema_version": VERSION, "run_id": self.run_id, "plan_hash": self.plan.plan_hash,
                    **identity, "status": event.status, "output_hash": output_hash,
                    "provenance": provenance, "warnings": warnings,
@@ -598,7 +601,7 @@ def _validate_identity(record, run_id, plan_hash):
 def _verify_normalization(run_dir, receipt):
     link = receipt.get("timestamp_normalization")
     if link is None:
-        if WARNING_CODE in receipt["warnings"]:
+        if any(w in receipt["warnings"] for w in (WARNING_CODE, FALLBACK_WARNING_CODE)):
             raise ProtocolError("normalization warning lacks evidence")
         return
     if not isinstance(link, dict) or set(link) != {"ref", "hash"}:
@@ -627,6 +630,11 @@ def _verify_normalization(run_dir, receipt):
                 or max(c["displacement_ms"] for c in changes) != audit["max_displacement_ms"]
                 or sum(c["displacement_ms"] for c in changes) != audit["total_displacement_ms"]):
             raise ValueError("normalization bytes or summary differ")
+        fallback = changes[0].get("fallback")
+        if (_digest(audit.get("fallback")) != _digest(fallback)
+                or (FALLBACK_WARNING_CODE in receipt["warnings"] and (not fallback or WARNING_CODE not in receipt["warnings"]))
+                or (fallback and WARNING_CODE in receipt["warnings"] and FALLBACK_WARNING_CODE not in receipt["warnings"])):
+            raise ValueError("normalization fallback evidence or warning differs")
         validate_srt(safe_ref(run_dir, audit["normalized_ref"]))
     except (KeyError, OSError, ValueError) as exc:
         raise ProtocolError("normalization evidence missing or invalid") from exc

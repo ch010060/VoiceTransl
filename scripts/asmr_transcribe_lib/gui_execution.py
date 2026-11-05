@@ -17,7 +17,7 @@ from .local_faster_whisper import FasterWhisperConfig, find_faster_whisper_model
 from .pipeline import TaskResult, process_audio_task, run_tasks
 from .runtime import CancellationToken, ObserverError, PipelineCancelled, PipelineEvent, TaskRuntime
 from .gui_errors import ExecutionFailure, failure_record, srt_failure
-from .srt_normalization import normalize_srt_bytes, TimestampOrderError, WARNING_CODE
+from .srt_normalization import normalize_srt_bytes, TimestampOrderError, WARNING_CODE, FALLBACK_WARNING_CODE
 
 
 @dataclass(frozen=True)
@@ -235,6 +235,8 @@ def run_plan(plan: ExecutionPlan, *, project_root: Path | str,
                         if created:
                             temporary.unlink(missing_ok=True)
                     timestamp_warnings.append(WARNING_CODE)
+                    if changes[0].get("fallback"):
+                        timestamp_warnings.append(FALLBACK_WARNING_CODE)
                 emit(PipelineEvent("asr_completed", track.track_id, "asr", "running"))
                 return result
             finally:

@@ -10,6 +10,8 @@ MAX_BACKWARD_MS_PER_CUE = 1000
 MAX_REVERSED_CUES = 10
 MAX_REVERSED_PERCENT = 2
 WARNING_CODE = "SRT_TIMESTAMP_NORMALIZED"
+FALLBACK_WARNING_CODE = "SRT_TIMESTAMP_FALLBACK_USED"
+FALLBACK_POLICY = "single-reversal-ratio-fallback-v1"
 
 
 class TimestampOrderError(ValueError):
@@ -30,6 +32,7 @@ def normalize_srt_start_order(blocks: Sequence[SubtitleBlock]) -> tuple[list[Sub
     """Compare against the normalized predecessor; bound count, ratio and displacement.
 
     Ratio denominator is ALL parsed Cues, inclusive 2% (integer arithmetic).
+    Only a single otherwise-valid reversal may bypass that ratio check.
     Total displacement is consequently bounded by 10 * 1000 ms per document.
     """
     if not blocks:
@@ -66,7 +69,11 @@ def normalize_srt_start_order(blocks: Sequence[SubtitleBlock]) -> tuple[list[Sub
     if len(changes) > MAX_REVERSED_CUES:
         raise TimestampOrderError("count_limit")
     if len(changes) * 100 > len(blocks) * MAX_REVERSED_PERCENT:
-        raise TimestampOrderError("ratio_limit")
+        if len(changes) != 1:
+            raise TimestampOrderError("ratio_limit")
+        changes[0]["fallback"] = {"fallback_used": True, "reversal_count": 1,
+                                  "max_backward_ms": changes[0]["displacement_ms"],
+                                  "normalization_policy": FALLBACK_POLICY}
     return result, changes
 
 

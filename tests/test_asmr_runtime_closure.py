@@ -83,15 +83,15 @@ def test_missing_asr_output_is_distinct(tmp_path):
     assert outcomes[0].failure["code"] == "ASR_OUTPUT_MISSING"
 
 
-@pytest.mark.parametrize("timings,valid", [
-    (["00:12:05,460 --> 00:12:05,560", "00:12:05,040 --> 00:12:19,000"], False),
-    (["00:00:30,000 --> 00:00:31,000", "00:00:00,000 --> 00:00:01,000"], False),
-    (["00:00:03,000 --> 00:00:04,000", "00:00:02,500 --> 00:00:04,000", "00:00:02,000 --> 00:00:04,000"], False),
-    (["00:00:01,000 --> 00:00:03,000", "00:00:02,000 --> 00:00:04,000"], True),
-    (["00:00:01,000 --> 00:00:01,000"], True),
-    (["00:00:02,000 --> 00:00:01,000"], False),
+@pytest.mark.parametrize("timings,valid,fallback", [
+    (["00:12:05,460 --> 00:12:05,560", "00:12:05,040 --> 00:12:19,000"], True, True),
+    (["00:00:30,000 --> 00:00:31,000", "00:00:00,000 --> 00:00:01,000"], False, False),
+    (["00:00:03,000 --> 00:00:04,000", "00:00:02,500 --> 00:00:04,000", "00:00:02,000 --> 00:00:04,000"], False, False),
+    (["00:00:01,000 --> 00:00:03,000", "00:00:02,000 --> 00:00:04,000"], True, False),
+    (["00:00:01,000 --> 00:00:01,000"], True, False),
+    (["00:00:02,000 --> 00:00:01,000"], False, False),
 ])
-def test_timestamp_repair_deferred_original_text_and_order_preserved(tmp_path, timings, valid):
+def test_timestamp_repair_deferred_original_text_and_order_preserved(tmp_path, timings, valid, fallback):
     plan = build_execution_plan(library(tmp_path, variants=False), mode="transcribe_only")
     original = "\n\n".join(f"{i}\n{timing}\nPRIVATE_CAPTION_{i}" for i, timing in enumerate(timings, 1)) + "\n"
     def asr(*, transcribe_srt_path, **kwargs):
@@ -99,16 +99,22 @@ def test_timestamp_repair_deferred_original_text_and_order_preserved(tmp_path, t
         return transcribe_srt_path
     store, outcomes, _ = execute(plan, tmp_path / "run", asr=asr)
     transcript = plan.tracks[0].task.transcribe_srt_path
-    assert transcript.read_text(encoding="utf-8") == original
+    expected = original.replace("00:12:05,040", "00:12:05,460") if fallback else original
+    assert transcript.read_text(encoding="utf-8") == expected
     assert outcomes[0].status == ("transcribed" if valid else "failed")
+    if fallback:
+        from scripts.asmr_transcribe_lib.srt_normalization import FALLBACK_WARNING_CODE
+        rec = read_json(store.run_dir / "receipts" / (plan.tracks[0].track_id + ".json"))
+        audit = read_json(store.run_dir / rec["timestamp_normalization"]["ref"])
+        assert FALLBACK_WARNING_CODE in rec["warnings"]
+        assert (store.run_dir / audit["raw_ref"]).read_text(encoding="utf-8") == original
+        assert audit["fallback"]["max_backward_ms"] == 420
     if not valid:
         error = read_json(store.run_dir / "receipts" / (plan.tracks[0].track_id + ".json"))["error"]
         assert error["code"] == "SRT_TIMESTAMP_ORDER_INVALID"
         assert error["details"]["automatic_repair"] == "REJECTED"
         if len(timings) == 3:
             assert error["details"]["anomaly_count"] == 2
-        if "12:05" in timings[0]:
-            assert error["details"]["examples"][0]["backward_ms"] == 420
     else:
         validate_srt(transcript)  # Preserve existing overlap/zero-length policy.
 
