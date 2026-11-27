@@ -11,7 +11,7 @@ import httpx
 import pytest
 
 from scripts.asmr_transcribe_lib.gui_execution import run_plan
-from scripts.asmr_transcribe_lib.gui_plan import build_execution_plan, make_provenance, path_key, _hash
+from scripts.asmr_transcribe_lib.gui_plan import build_execution_plan, make_provenance, path_key, _hash, _existing_common_subtitle
 from scripts.asmr_transcribe_lib.gui_plan_io import decode_plan, encode_plan, PlanTransportError
 from scripts.asmr_transcribe_lib.gui_preflight import preflight
 from scripts.asmr_transcribe_lib.gui_protocol import JSONLDecoder, ProtocolError
@@ -77,10 +77,15 @@ def execute(plan, tmp_path):
 
 
 @pytest.mark.parametrize("mode", ["full", "transcribe_only"])
-@pytest.mark.parametrize("extension", FORMATS)
-def test_optin_common_subtitles_are_read_only_skips(tmp_path, mode, extension):
-    root = make_library(tmp_path)
-    existing = subtitle(root / "RJ001/nested/voice01.wav", extension)
+@pytest.mark.parametrize("extension", FORMATS + (".VtT",))
+@pytest.mark.parametrize("audio_extension", [".wav", ".flac", ".mp3"])
+@pytest.mark.parametrize("full_audio_name", [False, True])
+def test_optin_common_subtitles_are_read_only_skips(tmp_path, mode, extension, audio_extension, full_audio_name):
+    root = make_library(tmp_path, (f"RJ001/nested/voice01{audio_extension}",))
+    audio = root / f"RJ001/nested/voice01{audio_extension}"
+    existing = subtitle(audio, extension)
+    if full_audio_name:
+        existing = existing.rename(audio.with_name(audio.name + extension))
     before = inventory(root)
     plan = build_execution_plan(root, mode=mode, skip_existing_subtitles=True)
     assert plan.executable, plan.issues
@@ -88,6 +93,7 @@ def test_optin_common_subtitles_are_read_only_skips(tmp_path, mode, extension):
     track = plan.planned_tracks[0]
     assert track.task.action == "skip"
     assert track.task.existing_subtitle_path == existing
+    assert _existing_common_subtitle(track.task) == existing
     assert decode_plan(encode_plan(plan)) == plan
     store, outcomes, result, calls = execute(plan, tmp_path)
     assert calls == []
@@ -101,8 +107,25 @@ def test_optin_common_subtitles_are_read_only_skips(tmp_path, mode, extension):
     assert "unverified_legacy" in receipt["warnings"]
     assert reconcile_run(store.run_dir, store.run_id, plan.plan_hash, 0)["counts"]["skipped"] == 1
     assert inventory(root) == before
-    if extension.lower() != ".srt":
+    if full_audio_name or extension.lower() != ".srt":
         assert not track.task.final_srt_path.exists()
+
+
+def test_full_audio_name_subtitle_requires_matching_audio_extension(tmp_path):
+    root = make_library(tmp_path)
+    (root / "RJ001/nested/voice01.mp3.vtt").write_text("WEBVTT\n", encoding="utf-8")
+    plan = build_execution_plan(root, skip_existing_subtitles=True)
+    assert plan.executable and plan.tracks[0].task.action == "process"
+
+
+def test_full_audio_name_preserves_subtitle_extension_priority(tmp_path):
+    root = make_library(tmp_path)
+    audio = root / "RJ001/nested/voice01.wav"
+    expected = subtitle(audio, ".srt")
+    alternate = subtitle(audio, ".vtt")
+    alternate.rename(audio.with_name(audio.name + ".vtt"))
+    plan = build_execution_plan(root, skip_existing_subtitles=True)
+    assert plan.tracks[0].task.existing_subtitle_path == expected
 
 
 @pytest.mark.parametrize("content", ["", "existing unparseable legacy captions"])

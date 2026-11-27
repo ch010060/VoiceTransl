@@ -142,7 +142,8 @@ def _validate(plan):
                     or source.suffix.lower() not in COMMON_SUBTITLE_EXTENSIONS):
                 raise PlanTransportError("invalid frozen existing subtitle skip")
             members = [tracks[member].task.audio_path for member in group.members]
-            if not any(source.parent == audio.parent and source.stem.casefold() == audio.stem.casefold()
+            if not any(source.parent == audio.parent
+                       and source.stem.casefold() in {audio.stem.casefold(), audio.name.casefold()}
                        for audio in members):
                 raise PlanTransportError("existing subtitle outside duplicate group")
         if track.dependencies:

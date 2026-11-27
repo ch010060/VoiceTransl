@@ -49,10 +49,11 @@ def file_stamp(path: Path) -> tuple:
 
 def _existing_common_subtitle(task: AudioTask) -> Path | None:
     parent = task.audio_path.parent
+    stems = {task.audio_path.stem.casefold(), task.audio_path.name.casefold()}
     phase = current_phase()
     if phase is None:
         candidates = [path for path in parent.iterdir()
-                      if path.stem.casefold() == task.audio_path.stem.casefold()
+                      if path.stem.casefold() in stems
                       and path.suffix.lower() in COMMON_SUBTITLE_EXTENSIONS]
     else:
         if parent not in phase.subtitles:
@@ -61,7 +62,7 @@ def _existing_common_subtitle(task: AudioTask) -> Path | None:
                 if path.suffix.lower() in COMMON_SUBTITLE_EXTENSIONS:
                     index.setdefault(path.stem.casefold(), []).append(path)
             phase.subtitles[parent] = index
-        candidates = phase.subtitles[parent].get(task.audio_path.stem.casefold(), ())
+        candidates = [path for stem in stems for path in phase.subtitles[parent].get(stem, ())]
     return min(candidates, key=lambda path: (COMMON_SUBTITLE_EXTENSIONS.index(path.suffix.lower()),
                                            path.name.casefold(), path.name), default=None)
 
